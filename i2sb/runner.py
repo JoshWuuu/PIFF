@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import distributed_util as dist_util
 from evaluation import build_resnet50
+from matplotlib import pyplot as plt
 
 from . import util
 from .network import Image256Net
@@ -33,10 +34,11 @@ from .embedding import RainfallEmbedder
 
 from ipdb import set_trace as debug
 
-def build_optimizer_sched(opt, net, log):
+def build_optimizer_sched(opt, rainfall_embber, net, log):
 
     optim_dict = {"lr": opt.lr, 'weight_decay': opt.l2_norm}
-    optimizer = AdamW(net.parameters(), **optim_dict)
+    params = list(net.parameters()) + list(rainfall_embber.parameters())
+    optimizer = AdamW(params, **optim_dict)
     log.info(f"[Opt] Built AdamW optimizer {optim_dict=}!")
 
     if opt.lr_gamma < 1.0:
@@ -73,6 +75,26 @@ def all_cat_cpu(opt, log, t):
     gathered_t = dist_util.all_gather(t.to(opt.device), log=log)
     return torch.cat(gathered_t).detach().cpu()
 
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+def plot_grad_flow(model):
+    ave_grads = []
+    layers = []
+    for n, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean().item())
+    fig = plt.figure(figsize=(10,5))
+    plt.plot(ave_grads, alpha=0.5, color="b")
+    plt.hlines(0, 0, len(ave_grads)+1, linewidth=1, color="k")
+    # plt.xticks(range(0,len(ave_grads),1), layers, rotation="vertical")
+    plt.xlim(xmin=0, xmax=len(ave_grads))
+    plt.xlabel("Layers")
+    plt.ylabel("Average Gradient Magnitude")
+    plt.title("Gradient Flow")
+    plt.grid(True)
+    plt.show()
+
 class Runner(object):
     def __init__(self, opt, log, save_opt=True):
         super(Runner,self).__init__()
@@ -103,9 +125,10 @@ class Runner(object):
         log.info(f"[Diffusion] Built I2SB diffusion: steps={len(betas)}!")
 
         noise_levels = torch.linspace(opt.t0, opt.T, opt.interval, device=opt.device) * opt.interval
-        self.net = Image256Net(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1)
-        self.ema = ExponentialMovingAverage(self.net.parameters(), decay=opt.ema)
+        self.net = Image256Net(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1, spm=opt.spm)
         self.rainfall_emb = RainfallEmbedder(256, 1)
+        params = list(self.net.parameters()) + list(self.rainfall_emb.parameters())
+        self.ema = ExponentialMovingAverage(params, decay=opt.ema)
 
         if opt.load:
             checkpoint = torch.load(opt.load, map_location="cpu")
@@ -245,32 +268,24 @@ class Runner(object):
         out = model.decode(x_latent_quant)
         return out
     
-    def compute_label(self, step, x0, xt):
+    def compute_label(self, step, x0, xt, x1):
         """ Eq 12 """
         std_fwd = self.diffusion.get_std_fwd(step, xdim=x0.shape[1:])
         label = (xt - x0) / std_fwd
+        # label = x1 - x0
         return label.detach()
 
-    def compute_pred_x0(self, step, xt, net_out, clip_denoise=False):
+    def compute_pred_x0(self, step, xt, x1, net_out, clip_denoise=False):
         """ Given network output, recover x0. This should be the inverse of Eq 12 """
         std_fwd = self.diffusion.get_std_fwd(step, xdim=xt.shape[1:])
+        # pred_x0 = x1 - net_out
         pred_x0 = xt - std_fwd * net_out
         if clip_denoise: pred_x0.clamp_(-1., 1.)
         return pred_x0
 
     def sample_batch(self, opt, loader, corrupt_method):
-        if opt.corrupt == "mixture":
-            clean_img, corrupt_img, y, image_name = next(loader)
-            mask = None
-        elif "inpaint" in opt.corrupt:
-            clean_img, y = next(loader)
-            with torch.no_grad():
-                corrupt_img, mask = corrupt_method(clean_img.to(opt.device))
-        else:
-            clean_img, y = next(loader)
-            with torch.no_grad():
-                corrupt_img = corrupt_method(clean_img.to(opt.device))
-            mask = None
+        clean_img, corrupt_img, mask, y, image_name, spm = next(loader)
+            # convert clean_image to binary mask, >250=0 <250=1
 
         # os.makedirs(".debug", exist_ok=True)
         # tu.save_image((clean_img+1)/2, ".debug/clean.png", nrow=4)
@@ -280,10 +295,9 @@ class Runner(object):
         y  = y.detach().to(opt.device)
         x0 = clean_img.detach().to(opt.device)
         x1 = corrupt_img.detach().to(opt.device)
-        if mask is not None:
-            mask = mask.detach().to(opt.device)
-            x1 = (1. - mask) * x1 + mask * torch.randn_like(x1)
+        mask = mask.detach().to(opt.device)
         cond = x1.detach() if opt.cond_x1 else None
+        spm = spm.detach().to(opt.device)
 
         if opt.add_x1_noise: # only for decolor
             x1 = x1 + torch.randn_like(x1)
@@ -294,16 +308,105 @@ class Runner(object):
             x0 = self.encode(x0, cond=False)
             x1 = self.encode(x1, cond=False)
             cond = self.cond_stage_model(cond)
+            mask = self.cond_stage_model(mask) if mask is not None else None
 
-        return x0, x1, mask, y, cond
+        return x0, x1, mask, y, cond, spm
 
     def train(self, opt, train_dataset, val_dataset, corrupt_method):
+        gradient_list = []
+        embedder_gradient_list = []
+        losses = []
+
+        def plot_losses():
+            plt.figure(figsize=(12, 8))
+            plt.plot(np.log(losses))
+            plt.xlabel("Iterations")
+            plt.ylabel("Log Loss")
+            plt.title("Log Loss per Iteration")
+            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\losses_log_scale_otode_continuous_128_norm_SDE.png")
+    
+        def plot_model_gradients(model, embedder):
+            def format_scientific(val):
+                # Format the number using scientific notation with no decimal places.
+                s = f"{val:.0e}"  # e.g., 0.000001 --> "1e-06"
+                # Remove any extra zero in the exponent, e.g., change "e-06" to "e-6"
+                s = s.replace("e-0", "e-")
+                s = s.replace("e+0", "e+")
+                return s
+            gradients = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    # Compute the mean absolute value of the gradient
+                    grad_norm = param.grad.abs().mean().item()
+                    gradients[name] = grad_norm
+            gradient_list.append(gradients)
+            # print(model)
+            print("Top 25 parameters with the largest gradient magnitudes:")
+            sorted_gradients = sorted(gradients.items(), key=lambda x: x[1], reverse=True)[:25]
+            for param_name, grad_val in sorted_gradients:
+                print(f"{param_name}: {format_scientific(grad_val)}")
+
+            print("\nBottom 25 parameters with the smallest gradient magnitudes:")
+            sorted_gradients_low = sorted(gradients.items(), key=lambda x: x[1])[:25]
+            for param_name, grad_val in sorted_gradients_low:
+                print(f"{param_name}: {format_scientific(grad_val)}")
+
+            plt.figure(figsize=(12, 8))
+            for epoch, gradients in enumerate(gradient_list):
+                keys = list(gradients.keys())
+                values = [gradients[key] for key in keys]
+
+                plt.plot(range(len(keys)), np.log(values), label=f"Iter {(epoch+1)*200}")
+            
+            # plt.xticks(range(len(keys)), keys, rotation=45, ha='right')
+            plt.xlabel("Parameters")
+            plt.ylabel("Log Mean Gradient Magnitude")
+            plt.title("Log Gradient Magnitude per Parameter Across 200 iterations")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\gradient_plot.png")
+
+            embedder_gradients = {}
+            for name, param in embedder.named_parameters():
+                if param.grad is not None:
+                    # Compute the mean absolute value of the gradient
+                    grad_norm = param.grad.abs().mean().item()
+                    embedder_gradients[name] = grad_norm
+            
+            embedder_gradient_list.append(embedder_gradients)
+            print("Top 25 parameters with the largest gradient magnitudes:")
+            sorted_gradients = sorted(embedder_gradients.items(), key=lambda x: x[1], reverse=True)[:25]
+            for param_name, grad_val in sorted_gradients:
+                print(f"{param_name}: {format_scientific(grad_val)}")
+            print("\nBottom 25 parameters with the smallest gradient magnitudes:")
+            sorted_gradients_low = sorted(embedder_gradients.items(), key=lambda x: x[1])[:25]
+            for param_name, grad_val in sorted_gradients_low:
+                print(f"{param_name}: {format_scientific(grad_val)}")
+
+            fig = plt.figure(figsize=(12, 8))
+            for epoch, gradients in enumerate(embedder_gradient_list):
+                keys = list(gradients.keys())
+                values = [gradients[key] for key in keys]
+
+                plt.plot(range(len(keys)), np.log(values), label=f"Iter {(epoch+1)*200}")
+            
+            # plt.xticks(range(len(keys)), keys, rotation=45, ha='right')
+            plt.xlabel("Parameters")
+            plt.ylabel("Log Mean Gradient Magnitude")
+            plt.title("Log Gradient Magnitude per Parameter Across 200 iterations")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\embedder_gradient_plot.png")
+            
         self.writer = util.build_log_writer(opt)
         log = self.log
 
         net = self.net
         ema = self.ema
-        optimizer, sched = build_optimizer_sched(opt, net, log)
+        # print(net)
+        rainfall_embber = self.rainfall_emb
+        print(rainfall_embber)
+        optimizer, sched = build_optimizer_sched(opt, rainfall_embber, net, log)
 
         train_loader = util.setup_loader(train_dataset, opt.microbatch)
         val_loader   = util.setup_loader(val_dataset,   opt.microbatch)
@@ -318,25 +421,48 @@ class Runner(object):
 
             for _ in range(n_inner_loop):
                 # ===== sample boundary pair =====
-                x0, x1, mask, y, cond = self.sample_batch(opt, train_loader, corrupt_method)
+                x0, x1, mask, y, cond, spm = self.sample_batch(opt, train_loader, corrupt_method)
 
                 # ===== compute loss =====
-                step = torch.randint(0, opt.interval, (x0.shape[0],))
+                if opt.timestep_importance == 'continuous':
+                    t1, t0 = 1, 0
+                    step = torch.rand((x0.shape[0],)) * (t1 - t0)
+                    # make step shape = (x0.shape[0], 1, 1, 1)
+                    step = step.view(-1, 1, 1, 1).to(x0.device)
+                    if opt.ot_ode:
+                        xt = (1-step) * x0 + step * x1
+                        label = x1 - x0
+                    if not opt.ot_ode:
+                        # var = (step**2 * (1-step)**2) / (step**2 + (1-step)**2)
+                        # randn + loss x1-x0 perform good
+                        var = step * (1-step)
+                        rand = torch.randn_like(x0) * 0.1
+                        xt = (1-step) * x0 + step * x1 + rand 
+                        dvar = (1-2*step) / (2*var.sqrt() + 1e-2) 
+                        label = x1 - x0 
+                else:
+                    step = torch.randint(0, opt.interval, (x0.shape[0],))
+                    step = step.to(x0.device)
+                    xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
+                    label = self.compute_label(step, x0, xt, x1)
 
-                xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
-                label = self.compute_label(step, x0, xt)
 
-                rainfall_emb = self.rainfall_emb(y)
-                pred = net(xt, step, rainfall_emb, cond=cond)
+                # xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
+                # label = self.compute_label(step, x0, xt, x1)
+
+                rainfall_emb = rainfall_embber(y)
+                pred = net(xt, step, rainfall_emb, cond=cond, spm=spm)
                 assert xt.shape == label.shape == pred.shape
 
                 if mask is not None:
-                    pred = mask * pred
-                    label = mask * label
+                    pred_mask = mask * pred
+                    label_mask = mask * label
 
-                loss = F.mse_loss(pred, label)
+                loss = F.mse_loss(pred, label) + F.mse_loss(pred_mask, label_mask) * 0 if mask is not None else F.mse_loss(pred, label)
                 loss.backward()
-
+                losses.append(loss.item())
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1)
+            # plot_grad_flow(net)
             optimizer.step()
             ema.update()
             if sched is not None: sched.step()
@@ -351,7 +477,11 @@ class Runner(object):
             if it % 10 == 0:
                 self.writer.add_scalar(it, 'loss', loss.detach())
 
-            if it % 2000 == 0:
+            if it % 200 == 0 and it != 0:
+                plot_losses()
+            #     plot_model_gradients(net, rainfall_embber)
+
+            if it % 1000 == 0:
                 if opt.global_rank == 0:
                     torch.save({
                         "net": self.net.state_dict(),
@@ -371,7 +501,7 @@ class Runner(object):
         self.writer.close()
 
     @torch.no_grad()
-    def ddpm_sampling(self, opt, x1, y, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True, eval=False):
+    def ddpm_sampling(self, opt, x1, y, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True, eval=False, ode_method=None):
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -392,6 +522,7 @@ class Runner(object):
             
         x1 = x1.to(opt.device)
         if cond is not None: cond = cond.to(opt.device)
+        mask = None
         if mask is not None:
             mask = mask.to(opt.device)
             x1 = (1. - mask) * x1 + mask * torch.randn_like(x1)
@@ -399,18 +530,23 @@ class Runner(object):
         with self.ema.average_parameters():
             self.net.eval()
 
-            def pred_x0_fn(xt, step, rainfall_emb):
-                step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.long)
-                out = self.net(xt, step, rainfall_emb, cond=cond)
-                return self.compute_pred_x0(step, xt, out, clip_denoise=clip_denoise)
+            def pred_x0_fn(x1, xt, rainfall_emb, step, ode=None):
+                if not ode:
+                    step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.long)
+                    out = self.net(xt, step, rainfall_emb, cond=cond)
+                    return self.compute_pred_x0(step, x1, xt, out, clip_denoise=clip_denoise)
+                else:
+                    step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.float32)
+                    out = self.net(xt, step, rainfall_emb, cond=cond)
+                    return out
 
             rainfall_emb = self.rainfall_emb(y)
             xs, pred_x0 = self.diffusion.ddpm_sampling(
-                steps, pred_x0_fn, x1, rainfall_emb, mask=mask, ot_ode=opt.ot_ode, log_steps=log_steps, verbose=verbose,
+                steps, pred_x0_fn, x1, rainfall_emb, mask=mask, ot_ode=opt.ot_ode, log_steps=log_steps, verbose=verbose, ode_method=ode_method
             )
 
         b, *xdim = x1.shape
-        assert xs.shape == pred_x0.shape == (b, log_count, *xdim)
+        # assert xs.shape == pred_x0.shape == (b, log_count, *xdim)
 
         if opt.latent_space and eval:
             xs = xs[:, 0, ...].to(opt.device)

@@ -30,7 +30,7 @@ from i2sb import ckpt_util
 
 import colored_traceback.always
 from ipdb import set_trace as debug
-from corruption.mixture import floodDataset
+from corruption.mixture import floodDataset, singleDEMFloodDataset
 
 RESULT_DIR = Path("results")
 
@@ -101,8 +101,9 @@ def build_val_dataset(opt, log, corrupt_type):
     return val_dataset
 
 def get_recon_imgs_fn(opt, nfe):
-    sample_dir = RESULT_DIR / opt.ckpt / "test3_nfe{}{}".format(
-        nfe, "_clip" if opt.clip_denoise else ""
+    test_name = opt.sampling_method + "-dcvar"
+    sample_dir = RESULT_DIR / opt.ckpt / "test3_nfe{}{}_{}".format(
+        nfe, "_clip" if opt.clip_denoise else "", test_name
     )
     os.makedirs(sample_dir, exist_ok=True)
 
@@ -117,7 +118,7 @@ def compute_batch(ckpt_opt, corrupt_type, corrupt_method, out):
         corrupt_img = clean_img * (1. - mask) + mask
         x1          = clean_img * (1. - mask) + mask * torch.randn_like(clean_img)
     elif corrupt_type == "mixture":
-        clean_img, corrupt_img, y, image_name = out
+        clean_img, corrupt_img, binary_mask, y, image_name, _ = out
         x1 = corrupt_img.to(opt.device)
         y = y.to(opt.device)
         mask = None
@@ -131,7 +132,7 @@ def compute_batch(ckpt_opt, corrupt_type, corrupt_method, out):
     if ckpt_opt.add_x1_noise: # only for decolor
         x1 = x1 + torch.randn_like(x1)
 
-    return corrupt_img, x1, mask, cond, y, image_name
+    return corrupt_img, x1, mask, cond, y, image_name, _
 
 @torch.no_grad()
 def main(opt):
@@ -146,7 +147,8 @@ def main(opt):
     corrupt_method = build_corruption(opt, log, corrupt_type=corrupt_type)
 
     # build imagenet val dataset
-    val_dataset = floodDataset(opt, test=True)
+    # val_dataset = floodDataset(opt, test=True)
+    val_dataset = singleDEMFloodDataset(opt, test=True)
     n_samples = len(val_dataset)
 
     # build dataset per gpu and loader
@@ -156,6 +158,7 @@ def main(opt):
     )
 
     # build runner
+    # ckpt_opt.ot_ode = True
     runner = Runner(ckpt_opt, log, save_opt=False)
 
     # handle use_fp16 for ema
@@ -173,13 +176,13 @@ def main(opt):
     num = 0
     for loader_itr, out in enumerate(val_loader):
 
-        corrupt_img, x1, mask, cond, y, image_name = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
+        corrupt_img, x1, mask, cond, y, image_name, _ = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
         
         xs, _ = runner.ddpm_sampling(
-            ckpt_opt, x1, y, mask=mask, cond=cond, clip_denoise=opt.clip_denoise, nfe=nfe, verbose=opt.n_gpu_per_node==1, eval=True
+            ckpt_opt, x1, y, mask=mask, cond=cond, clip_denoise=opt.clip_denoise, nfe=nfe, verbose=opt.n_gpu_per_node==1, eval=True, ode_method=opt.sampling_method,
         )
-        # recon_img = xs[:, 0, ...].to(opt.device)
-        recon_img = xs
+        recon_img = xs[:, 0, ...].to(opt.device)
+        # recon_img = xs
 
         assert recon_img.shape == corrupt_img.shape
 
@@ -192,9 +195,10 @@ def main(opt):
         for i in range(len(recon_img)):
             rec = recon_img[i]
             rec = (rec + 1) / 2
+            # rec = rec * 0.056 + 0.98
             # get  the  last \\ 
             path = image_name[i].split("\\")[-1]
-            save_path = recon_imgs_fn.parent / f"recon_{path}.png"
+            save_path = recon_imgs_fn.parent / f"recon_{path}"
             tu.save_image(rec, save_path)
 
         # [-1,1]
@@ -237,9 +241,10 @@ if __name__ == '__main__':
     parser.add_argument("--partition",      type=str,  default=None,        help="e.g., '0_4' means the first 25% of the dataset")
 
     # sample
-    parser.add_argument("--batch-size",     type=int,  default=20)
-    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-latent-dems-b4',        help="the checkpoint name from which we wish to sample")
-    parser.add_argument("--nfe",            type=int,  default=100,        help="sampling steps")
+    parser.add_argument("--batch-size",     type=int,  default=30)
+    parser.add_argument("--sampling-method", type=str, default='euler-maruyama', help="sampling method")
+    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-single-b128-sde-norm-novar-rand01',        help="the checkpoint name from which we wish to sample")
+    parser.add_argument("--nfe",            type=int,  default=10,        help="sampling steps")
     parser.add_argument("--clip-denoise",   action="store_true",            help="clamp predicted image to [-1,1] at each")
     parser.add_argument("--use-fp16",       action="store_true",            help="use fp16 network weight for faster sampling")
 

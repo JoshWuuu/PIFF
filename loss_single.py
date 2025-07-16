@@ -61,8 +61,6 @@ def calculate_distances(real_folder, fake_folder):
         # l2_distances.append(np.sqrt(np.mean((real_image - fake_image) ** 2)))
         linf_distances.append(np.max(abs(real_image - fake_image)))
 
-    for filename, l1_mean in zip(real_filenames, l1_distances):
-        print(filename, l1_mean)
     # print filename with l1 distances
     # for filename, l1_distance in zip(real_filenames, l1_distances):
     #     print(filename, l1_distance)
@@ -80,8 +78,8 @@ if __name__ == "__main__":
 # Usage example
 # real_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/datasets/euv/image/test"
 # fake_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/results/p2p_wgangp_bs64_batch_pixel"
-    real_folder = "C:\\Users\\User\\Desktop\\dev\\test_total"
-    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-dems-b128-sde-norm-novar-rand01\\test3_nfe10_euler-maruyama-dcvar"
+    real_folder = "C:\\Users\\User\\Desktop\\dev\\new_test\\test_total"
+    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-latent-new-b4\\test3_nfe1"
     saving_path_name = 'latent_i2sb'
     real_filenames, fid, l1_distances, l2_distances, linf_distances, water_l1_depth, water_rmse_depth, max_water_depth, water_percentage_depth = calculate_distances(real_folder, fake_folder)
 
@@ -110,25 +108,25 @@ if __name__ == "__main__":
     print("\n")
 
     # calculate the metrics for the first 50 rows, 50-125 rows, and 125-500
-    # dis = [0, 50, 125, 500]
-    # for index,item in enumerate(dis):
-    #     if index == 0:
-    #         continue
-    #     average_l1_distance = np.mean(l1_distances[dis[index-1]:dis[index]])
-    #     average_l2_distance = np.mean(l2_distances[dis[index-1]:dis[index]])
-    #     average_linf_distance = np.mean(linf_distances[dis[index-1]:dis[index]])  
-    #     average_water_depth = np.mean(water_l1_depth[dis[index-1]:dis[index]])
-    #     average_water_rmse_depth = np.mean(water_rmse_depth[dis[index-1]:dis[index]])
-    #     average_max_water_depth = np.mean(max_water_depth[dis[index-1]:dis[index]])
-    #     average_water_percentage_depth = np.mean(water_percentage_depth[dis[index-1]:dis[index]])
-    #     print(f"Average L1 distance for {item} rows:", average_l1_distance)
-    #     print(f"Average L2 distance for {item} rows:", average_l2_distance)
-    #     print(f"Average L-infinity distance for {item} rows:", average_linf_distance)
-    #     print(f"Average Water Depth for {item} rows:", average_water_depth)
-    #     print(f"Average Water RMSE Depth for {item} rows:", average_water_rmse_depth)
-    #     print(f"Average Max Water Depth for {item} rows:", average_max_water_depth)
-    #     print(f"Average Water Percentage Depth for {item} rows:", average_water_percentage_depth)
-    #     print("\n")
+    dis = [0, 50, 125, 500]
+    for index,item in enumerate(dis):
+        if index == 0:
+            continue
+        average_l1_distance = np.mean(l1_distances[dis[index-1]:dis[index]])
+        average_l2_distance = np.mean(l2_distances[dis[index-1]:dis[index]])
+        average_linf_distance = np.mean(linf_distances[dis[index-1]:dis[index]])  
+        average_water_depth = np.mean(water_l1_depth[dis[index-1]:dis[index]])
+        average_water_rmse_depth = np.mean(water_rmse_depth[dis[index-1]:dis[index]])
+        average_max_water_depth = np.mean(max_water_depth[dis[index-1]:dis[index]])
+        average_water_percentage_depth = np.mean(water_percentage_depth[dis[index-1]:dis[index]])
+        print(f"Average L1 distance for {item} rows:", average_l1_distance)
+        print(f"Average L2 distance for {item} rows:", average_l2_distance)
+        print(f"Average L-infinity distance for {item} rows:", average_linf_distance)
+        print(f"Average Water Depth for {item} rows:", average_water_depth)
+        print(f"Average Water RMSE Depth for {item} rows:", average_water_rmse_depth)
+        print(f"Average Max Water Depth for {item} rows:", average_max_water_depth)
+        print(f"Average Water Percentage Depth for {item} rows:", average_water_percentage_depth)
+        print("\n")
 
 
 

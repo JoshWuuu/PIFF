@@ -9,10 +9,21 @@ def contrast_stretching(img):
     img = img.astype(np.uint8)
     return img
 
-image_path = 'C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-latent-new-b4\\test3_nfe1\\recon_RF133_d_020_00.png.png'
+image_path = 'C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-dems-otode-b16-mask\\test3_nfe10\\recon_61_RF08_024.png'
 # image_path = 'C:\\Users\\User\\Desktop\\dev\\new_test\\TEST_png\\RF133\\RF133_d_020_00.png'
 
-image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)[:,:,0]
+
+image_test_path = 'C:\\Users\\User\\Desktop\\dev\\test_dem\\61\\RF08\\61_RF08_024.png'
+image_test = cv2.imread(image_test_path, cv2.IMREAD_UNCHANGED)
+
+diff_image = cv2.absdiff(image, image_test)
+
+dem_image_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png\\61.png'
+dem = cv2.imread(dem_image_path, cv2.IMREAD_UNCHANGED)[:,:,0]
+
+# zeros = np.where(image == 0)
+# print("Zero-value pixels:", zeros)
 
 image = contrast_stretching(image)
 

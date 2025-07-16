@@ -20,9 +20,10 @@ from .ckpt_util import (
 )
 
 from ipdb import set_trace as debug
+from torch import nn
 
 class Image256Net(torch.nn.Module):
-    def __init__(self, log, noise_levels, use_fp16=False, cond=False, pretrained_adm=True, ckpt_dir="data/"):
+    def __init__(self, log, noise_levels, use_fp16=False, cond=False, pretrained_adm=True, ckpt_dir="data/", spm=False):
         super(Image256Net, self).__init__()
 
         # initialize model
@@ -31,7 +32,9 @@ class Image256Net(torch.nn.Module):
         with open(ckpt_pkl, "rb") as f:
             kwargs = pickle.load(f)
         kwargs["use_fp16"] = use_fp16
+        kwargs["num_channels"] = 128
         kwargs['image_size'] = 256
+        kwargs['num_heads'] = 8
         self.diffusion_model = create_model(**kwargs)
         log.info(f"[Net] Initialized network from {ckpt_pkl=}! Size={util.count_parameters(self.diffusion_model)}!")
 
@@ -42,14 +45,35 @@ class Image256Net(torch.nn.Module):
             # self.diffusion_model.load_state_dict(out)
             # log.info(f"[Net] Loaded pretrained adm {ckpt_pt=}!")
 
+        self.diffusion_model.apply(self.init_weights)
+        
         self.diffusion_model.eval()
         self.cond = cond
+        self.spm = spm
         self.noise_levels = noise_levels
 
-    def forward(self, x, steps, rainfall, cond=None):
+    def forward(self, x, steps, rainfall, cond=None, spm=None):
 
-        t = self.noise_levels[steps].detach()
+        # t = self.noise_levels[steps].detach()
+        t = steps.detach()
+        t = t[:, 0,0,0]
         assert t.dim()==1 and t.shape[0] == x.shape[0]
 
         x = torch.cat([x, cond], dim=1) if self.cond else x
+        x = torch.cat([x, spm], dim=1) if self.spm else x
         return self.diffusion_model(x, t, rainfall)
+    
+    def init_weights(self, module):
+        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Conv1d)):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, (nn.GroupNorm, nn.LayerNorm)):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0, std=0.02)

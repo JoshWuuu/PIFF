@@ -10,7 +10,7 @@ class AbstractEncoder(nn.Module):
 
 class RainfallEmbedder(AbstractEncoder):
     """Uses the BERT tokenizr model and add some transformer encoder layers"""
-    def __init__(self, n_embed, n_layer, vocab_size=600, max_seq_len=24,
+    def __init__(self, n_embed, n_layer, vocab_size=100, max_seq_len=24,
                  device="cuda",embedding_dropout=0.0):
         super().__init__()
         self.device = device

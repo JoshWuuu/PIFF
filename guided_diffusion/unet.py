@@ -464,7 +464,7 @@ class UNetModel(nn.Module):
             num_heads_upsample = num_heads
         context_dim = 256
         self.image_size = image_size
-        self.in_channels = 6
+        self.in_channels = in_channels
         self.model_channels = model_channels
         self.out_channels = out_channels
         self.num_res_blocks = num_res_blocks
@@ -491,7 +491,7 @@ class UNetModel(nn.Module):
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, 6, ch, 3, padding=1))]
+            [TimestepEmbedSequential(conv_nd(dims, 2, ch, 3, padding=1))]
         )
         self._feature_size = ch
         input_block_chans = [ch]

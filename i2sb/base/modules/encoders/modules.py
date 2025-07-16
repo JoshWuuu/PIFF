@@ -123,11 +123,14 @@ class SpatialRescaler(nn.Module):
             self.channel_mapper = nn.Conv2d(in_channels,out_channels,1,bias=bias)
 
     def forward(self,x):
+        if x.dtype != torch.float32:
+            x = x.float()
+        
         for stage in range(self.n_stages):
             x = self.interpolator(x, scale_factor=self.multiplier)
 
-        if self.remap_output:
-            x = self.channel_mapper(x)
+        # if self.remap_output:
+        #     x = self.channel_mapper(x)
         return x
 
     def encode(self, x):

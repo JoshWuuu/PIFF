@@ -23,7 +23,7 @@ from torch.multiprocessing import Process
 from logger import Logger
 from distributed_util import init_processes
 from corruption import build_corruption
-from corruption.mixture import floodDataset
+from corruption.mixture import floodDataset, singleDEMFloodDataset
 from dataset import imagenet
 from i2sb import Runner, download_ckpt
 
@@ -45,7 +45,7 @@ def create_training_options():
     # --------------- basic ---------------
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed",           type=int,   default=0)
-    parser.add_argument("--name",           type=str,   default='flood-latent-dems-b4',        help="experiment ID")
+    parser.add_argument("--name",           type=str,   default='flood-single-b128-sde-norm-novar-rand01',        help="experiment ID")
     parser.add_argument("--ckpt",           type=str,   default=None,        help="resumed checkpoint name")
     parser.add_argument("--gpu",            type=int,   default=0,        help="set only if you wish to run on a particular device")
     parser.add_argument("--n-gpu-per-node", type=int,   default=1,           help="number of gpu on each node")
@@ -58,24 +58,26 @@ def create_training_options():
     # --------------- SB model ---------------
     parser.add_argument("--image-size",     type=int,   default=256)
     parser.add_argument("--dataset-dir", type=Path, default="C:\\Users\\User\\Desktop\\dev\\50PNG\\", help="path to dataset")
-    parser.add_argument("--latent-space", action="store_true", default=True, help="use latent space model")
+    parser.add_argument("--latent-space", action="store_true", default=False, help="use latent space model")
     parser.add_argument("--normalize-latent", action="store_true", default=False, help="normalize latent space")
+    parser.add_argument("--timestep-importance", type=str, default='continuous', help="use timestep importance")
     parser.add_argument("--corrupt",        type=str,   default='mixture',        help="restoration task")
     parser.add_argument("--t0",             type=float, default=1e-4,        help="sigma start time in network parametrization")
     parser.add_argument("--T",              type=float, default=1.,          help="sigma end time in network parametrization")
     parser.add_argument("--interval",       type=int,   default=1000,        help="number of interval")
-    parser.add_argument("--beta-max",       type=float, default=1.5,         help="max diffusion for the diffusion model")
+    parser.add_argument("--beta-max",       type=float, default=0.1,         help="max diffusion for the diffusion model")
     # parser.add_argument("--beta-min",       type=float, default=0.1)
     parser.add_argument("--ot-ode",         action="store_true",  default=False,           help="use OT-ODE model")
     parser.add_argument("--clip-denoise",   action="store_true",             help="clamp predicted image to [-1,1] at each")
 
     # optional configs for conditional network
     parser.add_argument("--cond-x1",        action="store_true",  default=True,            help="conditional the network on degraded images")
+    parser.add_argument("--spm",          action="store_true",  default=False,           help="use SPM for conditional network")
     parser.add_argument("--add-x1-noise",   action="store_true",             help="add noise to conditional network")
 
     # --------------- optimizer and loss ---------------
-    parser.add_argument("--batch-size",     type=int,   default=4)
-    parser.add_argument("--microbatch",     type=int,   default=2,           help="accumulate gradient over microbatch until full batch-size")
+    parser.add_argument("--batch-size",     type=int,   default=128)
+    parser.add_argument("--microbatch",     type=int,   default=4,           help="accumulate gradient over microbatch until full batch-size")
     parser.add_argument("--num-itr",        type=int,   default=1000000,     help="training iteration")
     parser.add_argument("--lr",             type=float, default=5e-5,        help="learning rate")
     parser.add_argument("--lr-gamma",       type=float, default=0.99,        help="learning rate decay ratio")
@@ -141,8 +143,10 @@ def main(opt):
     #     train_dataset = mix.MixtureCorruptDatasetTrain(opt, train_dataset)
     #     val_dataset = mix.MixtureCorruptDatasetVal(opt, val_dataset)
 
-    train_dataset = floodDataset(opt, val=False)
-    val_dataset = floodDataset(opt, val=True)
+    # train_dataset = floodDataset(opt, val=False)
+    # val_dataset = floodDataset(opt, val=True)
+    train_dataset = singleDEMFloodDataset(opt, val=False)
+    val_dataset = singleDEMFloodDataset(opt, val=True)
     # build corruption method
     corrupt_method = build_corruption(opt, log)
 

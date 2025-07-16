@@ -156,6 +156,7 @@ class floodDataset(Dataset):
         super(floodDataset, self).__init__()
         self.opt = opt
         dem_path = Path(opt.dataset_dir) / 'dem_png'
+        self.spm_folder = 'C:\\Users\\User\\Desktop\\dev\\SPM_output'
         # list all the subfolder in the dem_path, for example subfolder is 1, 2, 3 then return me [1, 2, 3]
         
         self.dem_stat = Path(opt.dataset_dir) / 'dem_png/elevation_stats.csv'
@@ -180,6 +181,7 @@ class floodDataset(Dataset):
         # Initialize lists to store cell values and their positions
         rainfall_cum_value = []
         cell_positions = []
+        spm = []
 
         val = False
         # Iterate through each column
@@ -194,19 +196,28 @@ class floodDataset(Dataset):
                 # Iterate through each row in the current column
                 for row in range(len(rainfall)):
                     cell_value = rainfall.iloc[row][col]
-                    cell_values.append(np.floor(cell_value))
+                    cell_values.append(np.ceil(cell_value))
                     # make it a len 24 list if not append 0 in front
                     temp = [0] * (24 - len(cell_values))
                     temp.extend(cell_values)
                     if len(temp) == 25:
                         temp = temp[1:]
-                    rainfall_cum_value.append(temp)
+                    sum_rainfall = sum(temp[:])
+                    # ceil the number to the nearest 5 multiple
+                    # if all the value is 0, then skip
+                    if not test and sum_rainfall <= 5:
+                        if np.random.rand() < 0.8:
+                            continue
+                    spm.append(int(np.ceil(sum_rainfall / 5) * 5))
+                    rainfall_cum_value.append(temp[:])
                     # col_num is the rainfall index, and row is the time index
                     cell_positions.append((dem_num, col_num, row))   
 
         self.rainfall = rainfall_cum_value
         self.cell_positions = cell_positions
-
+        self.spm = spm
+        # print training data len
+        print(f"Training data length: {len(self.cell_positions)}")
         # add transform , to tensor and normalize
         self.transform = T.Compose([
             T.ToTensor(),
@@ -241,19 +252,23 @@ class floodDataset(Dataset):
     def __getitem__(self, index):
         cell_position = self.cell_positions[index]
         rainfall = self.rainfall[index]
+        spm = self.spm[index]
         dem_path = self.__find_dem_image(cell_position)
         dem_image = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)[:,:,0]
-        dem_image = cv2.cvtColor(dem_image, cv2.COLOR_GRAY2BGR)
+        # dem_image = cv2.cvtColor(dem_image, cv2.COLOR_GRAY2BGR)
         dem_cur_state = self.dem_stat[self.dem_stat['Filename'] == cell_position[0]]
-        min_elev = int(dem_cur_state['Min Elevation'])
-        max_elev = int(dem_cur_state['Max Elevation'])
+        min_elev = int(dem_cur_state['Min Elevation'].iloc[0])
+        max_elev = int(dem_cur_state['Max Elevation'].iloc[0])
         # do a normalization with max = 410 min = -3, with current max = max_elev, min = min_elev
         real_height = dem_image / 255 * (max_elev - min_elev) + min_elev
-        dem_image = (real_height - (-3)) / (51 + 3) * 255
+        dem_image = (real_height - (-3)) / (125 + 3) * 255
         # clamp dem_image to 0-255
         dem_image = np.clip(dem_image, 0, 255)
         dem_image = np.array(dem_image, dtype=np.uint8)
         
+        spm_path = os.path.join(self.spm_folder, f'SPM_1_{spm}.png')
+        spm_image = cv2.imread(spm_path, cv2.IMREAD_GRAYSCALE)
+        # dem_image -= dem_image.min()
         rainfall = np.array(rainfall, dtype=np.int64)
         # rainfall = rainfall.reshape(1, 24)
 
@@ -264,7 +279,16 @@ class floodDataset(Dataset):
         # remove the fourth channel
         # flood_image = flood_image[:, :, 2]
         # flood_image = cv2.cvtColor(flood_image, cv2.COLOR_BGR2GRAY)
-        flood_image = cv2.cvtColor(flood_image, cv2.COLOR_GRAY2BGR)
+        # flood_image = cv2.cvtColor(flood_image, cv2.COLOR_GRAY2BGR)
+        # convert flood_image to binary mask, >250=0 <250=1
+        binary_mask = (flood_image <= 250).astype('uint8')
+        # binary_mask = cv2.cvtColor(binary_mask, cv2.COLOR_BGR2GRAY)
+        # unsqueeze first dimension of binary_mask
+        binary_mask = np.expand_dims(binary_mask, axis=0)
+        # flood_image = flood_image *4 / 3
+        # flood_image = (flood_image-32) / (255-32) * 255
+        flood_image = np.array(flood_image, dtype=np.uint8)
+        # flood_image = np.clip(flood_image, 0, 255)
         # IF FLOOD image not 256x256, print the shape and the image_path
         # flood_image = Image.open(image_path).convert('RGB')
         # flood_image = np.array(flood_image)
@@ -278,8 +302,111 @@ class floodDataset(Dataset):
         dem_image = self.transform(dem_image)
         flood_image = self.transform(flood_image)
 
-        dem_image = (dem_image * 2) - 1
-        flood_image = (flood_image * 2) - 1
+        dem_image = (dem_image - 0.18) / 0.22
+        flood_image = (flood_image - 0.98) / 0.056
 
-        return flood_image, dem_image, rainfall, image_path
+        return flood_image, dem_image, binary_mask, rainfall, image_path, spm_image
     
+class singleDEMFloodDataset(Dataset):
+    def __init__(self, opt, val=False, test=False):
+        super(singleDEMFloodDataset, self).__init__()
+        self.opt = opt
+        dem_path = 'C:\\Users\\User\\Desktop\\dev\\new_train\\dem.png'
+        self.spm_folder = 'C:\\Users\\User\\Desktop\\dev\\SPM_output'
+        self.dem = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)[:,:,0]
+        self.test = test
+
+        self.flood_path = 'C:\\Users\\User\\Desktop\\dev\\new_train\\tainan_png'
+
+        rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\new_train\\train.csv'
+        if test:
+            rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\new_test\\test.csv'
+            self.flood_path = 'C:\\Users\\User\\Desktop\\dev\\new_test\\TEST_png'
+
+        rainfall = pd.read_csv(rainfall_path)
+        # remove first row, no 0 row 
+        rainfall = rainfall.iloc[:, :]
+
+        # Initialize lists to store cell values and their positions
+        rainfall_cum_value = []
+        cell_positions = []
+        spm = []
+        val = False
+        # Iterate through each column
+        for col in rainfall.columns:
+            if col == 'time':
+                continue
+            col_num = int(col.split("_")[1])
+            if (val and col_num not in [2]) or (not val and col_num in []):
+                continue
+            cell_values = []
+            # Iterate through each row in the current column
+            for row in range(len(rainfall)):
+                cell_value = rainfall.iloc[row][col]
+                cell_values.append(np.floor(cell_value))
+                # make it a len 24 list if not append 0 in front
+                temp = [0] * (24 - len(cell_values))
+                temp.extend(cell_values)
+                if len(temp) == 25:
+                    temp = temp[1:]
+                sum_rainfall = sum(temp[:])
+                spm.append(int(np.ceil(sum_rainfall / 5) * 5))
+                rainfall_cum_value.append(temp)
+                cell_positions.append((col_num, row))
+
+        self.rainfall = rainfall_cum_value
+        self.cell_positions = cell_positions
+        self.spm = spm
+        print(f"Training data length: {len(self.cell_positions)}")
+        # add transform , to tensor and normalize
+        self.transform = T.Compose([
+            T.ToTensor(),
+            # T.Lambda(lambda t: (t * 2) - 1)
+        ])
+
+    def __find_image(self, cell_position, flood_path):
+        col, row = cell_position
+        if col < 100:
+            folder_name = f"RF{col:02d}"
+        else:
+            folder_name = f"RF{col}"
+        if self.test:
+            if col < 100:
+                folder_name = f"RF{col:02d}"
+            else:
+                folder_name = f"RF{col}"
+        image_name = f"{folder_name}_d_{row:03d}_00.png"
+        image_path = os.path.join(flood_path, folder_name, image_name)
+        return image_path
+
+    def __len__(self):
+        return len(self.cell_positions)
+
+    def __getitem__(self, index):
+        dem_image = self.dem
+        rainfall = self.rainfall[index]
+        spm = self.spm[index]
+        rainfall = np.array(rainfall, dtype=np.int64)
+        # rainfall = rainfall.reshape(1, 24)
+        spm_path = os.path.join(self.spm_folder, f'SPM_1_{spm}.png')
+        spm_image = cv2.imread(spm_path, cv2.IMREAD_GRAYSCALE)
+        cell_position = self.cell_positions[index]
+
+        image_path = self.__find_image(cell_position, self.flood_path)
+
+        flood_image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        
+        binary_mask = (flood_image <= 250).astype('uint8')
+        binary_mask = np.expand_dims(binary_mask, axis=0)
+        flood_image = np.array(flood_image, dtype=np.uint8)
+        
+        dem_image = self.transform(dem_image)
+        flood_image = self.transform(flood_image)
+
+        dem_image = (dem_image - dem_image.mean()) / dem_image.std()
+        flood_image = (flood_image - 0.098) / 0.035
+
+        # dem_image = (dem_image *2) - 1
+        # flood_image = (flood_image *2) - 1
+
+        return flood_image, dem_image, binary_mask, rainfall, image_path, spm_image
