@@ -10,6 +10,7 @@ import numpy as np
 import pickle
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW, lr_scheduler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,6 +20,7 @@ import torchvision.utils as tu
 import torchmetrics
 from tqdm import tqdm
 
+# from PIFF import loss
 import distributed_util as dist_util
 from evaluation import build_resnet50
 from matplotlib import pyplot as plt
@@ -26,20 +28,27 @@ from matplotlib import pyplot as plt
 from . import util
 from .network import Image256Net
 from .diffusion import Diffusion, disabled_train, create_model_config
-from i2sb.VQGAN.vqgan import VQModel
+from .nv_loss import navier_stokes_operators, navier_stokes_operators_torch, continuity_residual_torch
+# from i2sb.VQGAN.vqgan import VQModel
 from i2sb.base.modules.encoders.modules import SpatialRescaler
 from torch.utils.data import DataLoader
 from corruption.mixture import floodDataset
 from .embedding import RainfallEmbedder
 
 from ipdb import set_trace as debug
+from fvcore.nn import FlopCountAnalysis
 
-def build_optimizer_sched(opt, rainfall_embber, net, log):
+def build_optimizer_sched(opt, rainfall_embber, net, log, spm=None):
 
-    optim_dict = {"lr": opt.lr, 'weight_decay': opt.l2_norm}
-    params = list(net.parameters()) + list(rainfall_embber.parameters())
-    optimizer = AdamW(params, **optim_dict)
-    log.info(f"[Opt] Built AdamW optimizer {optim_dict=}!")
+    # optim_dict = {"lr": opt.lr, 'weight_decay': opt.l2_norm}
+    # params = list(net.parameters()) + list(rainfall_embber.parameters()) + list(spm.parameters())
+    params = [
+        {"params": net.parameters(), "lr": opt.lr, "weight_decay": opt.l2_norm},
+        {"params": rainfall_embber.parameters(), "lr": 1e-4, "weight_decay": opt.l2_norm},
+        # {"params": spm.parameters(), "lr": 1e-3, "weight_decay": opt.l2_norm},
+    ]
+    optimizer = AdamW(params)
+    # log.info(f"[Opt] Built AdamW optimizer {optim_dict=}!")
 
     if opt.lr_gamma < 1.0:
         sched_dict = {"step_size": opt.lr_step, 'gamma': opt.lr_gamma}
@@ -95,22 +104,185 @@ def plot_grad_flow(model):
     plt.grid(True)
     plt.show()
 
+class WeightedSumHead(nn.Module):
+    """
+    Predicts a scalar SPM rainfall from a 24-dim rainfall vector:
+      spm_pred = x @ w   (no bias, no softmax)
+    w initialized to all ones.
+    """
+    def __init__(self, dim: int = 24, jitter: float = 1e-2):
+        super().__init__()
+        self.lin = nn.Linear(dim, 1, bias=False)
+        with torch.no_grad():
+            self.lin.weight.fill_(1.0)
+            self.lin.weight.add_(jitter * torch.randn_like(self.lin.weight))
+        
+    def forward(self, rainfall_vec: torch.Tensor):  # (B, 24)
+        # returns (B, 1) continuous rainfall amount (same unit as your SPM bins)
+        # convert rainfall to float 64
+        dtype = self.lin.weight.dtype
+        device = self.lin.weight.device
+        rainfall_vec = rainfall_vec.to(device=device, dtype=dtype)
+        return self.lin(rainfall_vec)
+
+class WeightedSumHeadUpdated(nn.Module):
+    """
+    Delta-with-base version.
+    - Learn a shared base weight vector w_base (size = dim)
+    - Each DEM id has a learned delta vector; unseen DEMs use delta=0 (fallback to base)
+    - Prediction: y = sum_i x_i * (w_base[i] + delta_dem[i])
+    """
+    def __init__(self, dim: int = 24, dem_num: int = 60, jitter: float = 1e-2):
+        super().__init__()
+        self.dim = dim
+        self.dem_num = dem_num
+        self.test_dem_num = [61, 62, 65, 67, 69]
+
+        # Shared base weights
+        self.w_base = nn.Parameter(torch.ones(dim))
+        with torch.no_grad():
+            self.w_base.add_(jitter * torch.randn_like(self.w_base))
+
+        # DEM-specific deltas (start at zero so base is the initial fallback)
+        self.w_dem_delta = nn.Embedding(dem_num, dim)
+        with torch.no_grad():
+            self.w_dem_delta.weight.zero_()
+
+    def forward(self, rainfall_vec: torch.Tensor, dem_id: torch.Tensor) -> torch.Tensor:
+        """
+        rainfall_vec: (B, dim)
+        dem_id:       (B,) LongTensor of DEM indices
+        - If dem_id is outside [0, dem_num-1], delta=0 (fallback to base)
+        Returns: (B, 1)
+        """
+        if dem_id.dtype != torch.long:
+            dem_id = dem_id.long()
+
+        device = self.w_base.device
+        dtype = self.w_base.dtype
+        x = rainfall_vec.to(device=device, dtype=dtype)
+        dem_id = dem_id.to(device=device)
+
+        # Known mask and safe indices (clamped to valid range for embedding lookup)
+        known = (dem_id >= 0) & (dem_id < self.dem_num)
+        idx = torch.clamp(dem_id, 0, max(self.dem_num, 0)) - 1
+
+        # Gather delta; zero it where DEM is unknown
+        delta = self.w_dem_delta(idx)                    # (B, dim)
+        delta = torch.where(known.unsqueeze(-1), delta, torch.zeros_like(delta))
+
+        # Combine base + delta and do weighted sum
+        w = self.w_base.unsqueeze(0) + delta             # (B, dim)
+        y = (x * w).sum(dim=-1, keepdim=True)            # (B, 1)
+        return y
+    
+class DeviationsAroundOnes(nn.Module):
+    """
+    w = 1 + P u, where P projects to zero-sum subspace so sum(w) stays near 24.
+    (Keeps a 'sum' baseline but learns variations.)
+    """
+    def __init__(self, dim=24, nonneg=False):
+        super().__init__()
+        self.dim = dim
+        # u are free params; init small to break symmetry
+        self.u = nn.Parameter(1e-2 * torch.randn(dim))
+        # projection matrix P = I - (1/d) 11^T ensures sum(Pu)=0
+        P = torch.eye(dim) - torch.full((dim, dim), 1.0/dim)
+        self.register_buffer("P", P)
+        self.nonneg = nonneg
+
+    def weight(self):
+        w = 1.0 + self.P @ self.u
+        if self.nonneg:
+            w = F.softplus(w)   # keep weights ≥0, optional
+        return w
+
+    def forward(self, x):  # x: (B, dim)
+        return x @ self.weight().unsqueeze(-1)
+    
+class ScaledSoftmaxHead(nn.Module):
+    """
+    w = c * softmax(a).  Init a=0 => equal weights; set c_init=dim => sum(x) at init.
+    """
+    def __init__(self, dim=24, c_init=None):
+        super().__init__()
+        self.dim = dim
+        self.a = nn.Parameter(torch.zeros(dim))          # logits
+        self.c = nn.Parameter(torch.tensor(float(dim if c_init is None else c_init)))
+
+    def weight(self):
+        w = torch.softmax(self.a, dim=0) * self.c
+        return w
+
+    def forward(self, x):  # (B, dim)
+        return x @ self.weight().unsqueeze(-1)
+
+def soft_bin_blend(spm_bank: torch.Tensor,  # (K, 1, H, W)
+                   spm_bins: torch.Tensor,  # (K,)
+                   spm_pred: torch.Tensor,  # (B, 1)
+                   tau: float = 1):
+    """
+    Softly blend SPM images based on predicted rainfall amount.
+    Uses distance-based softmax over bins for differentiability.
+
+    Returns:
+      spm_blended: (B, 1, H, W)
+      weights:     (B, K) blending weights per sample
+    """
+    # Ensure shapes are device/dtype compatible
+    K = spm_bins.shape[0]
+    # distances (B, K)
+    d = (spm_pred.unsqueeze(1) - spm_bins.unsqueeze(0)).abs()
+    weights = torch.softmax(-d.squeeze(0) / tau, dim=1)                  # (B, K)
+    # Blend: einsum over K
+    spm_bank = spm_bank.to(spm_pred.device)                   # (K, 1, H, W)
+    spm_blended = torch.einsum('bk,bkchw->bchw', weights, spm_bank)
+    return spm_blended, weights
+
+def count_flops(model: nn.Module, rainfall_emb:nn.Module, inputs: tuple) -> float:
+    """
+    Counts the number of FLOPs (specifically, MACs) for a given model
+    and a tuple of input tensors.
+
+    Args:
+        model (nn.Module): The PyTorch model.
+        inputs (tuple): A tuple of input tensors to the model.
+
+    Returns:
+        float: The total number of GFLOPs.
+    """
+    # Note: fvcore counts MACs (Multiply-Accumulate operations), where 1 MAC is 
+    # often considered equivalent to 2 FLOPs (1 multiplication + 1 addition).
+    # The result is returned as the number of MACs.
+    rainfall_inputs = (1, 24)
+    rainfall_input = torch.ones(rainfall_inputs).to(next(model.parameters()).device)
+    rainfall_input = rainfall_input.to(dtype=torch.long)
+    flop_analyzer_rainfall = FlopCountAnalysis(rainfall_emb, (rainfall_input,))
+    print(f"Rainfall Embedder FLOPs: {flop_analyzer_rainfall.total() / 1e9:.2f} GFLOPs")
+    step = torch.tensor([10], dtype=torch.float32).to(next(model.parameters()).device)
+    model_input = torch.randn(inputs).to(next(model.parameters()).device)
+    rainfall_emb_shape = (1, 24, 256)
+    rainfall_emb = torch.randn(rainfall_emb_shape).to(next(model.parameters()).device)
+    flop_analyzer = FlopCountAnalysis(model, (model_input, step, rainfall_emb))
+    print(f"Network FLOPs: {flop_analyzer.total() / 1e9:.2f} GFLOPs")
+    return flop_analyzer.total()
+
 class Runner(object):
     def __init__(self, opt, log, save_opt=True):
         super(Runner,self).__init__()
 
         self.opt = opt
         self.model_config = create_model_config()
-        if opt.latent_space:
-            self.vqgan = VQModel(**vars(self.model_config.VQGAN.params)).eval()
-            self.vqgan.train = disabled_train
-            for param in self.vqgan.parameters():
-                param.requires_grad = False
-            print(f"load vqgan from {self.model_config.VQGAN.params.ckpt_path}")
+        # if opt.latent_space:
+        #     self.vqgan = VQModel(**vars(self.model_config.VQGAN.params)).eval()
+        #     self.vqgan.train = disabled_train
+        #     for param in self.vqgan.parameters():
+        #         param.requires_grad = False
+        #     print(f"load vqgan from {self.model_config.VQGAN.params.ckpt_path}")
             
-            self.cond_stage_model = SpatialRescaler(**vars(self.model_config.CondStageParams))
-            self.vqgan.to(opt.device)
-            self.cond_stage_model.to(opt.device)
+        #     self.cond_stage_model = SpatialRescaler(**vars(self.model_config.CondStageParams))
+        #     self.vqgan.to(opt.device)
+        #     self.cond_stage_model.to(opt.device)
 
         # Save opt.
         if save_opt:
@@ -127,9 +299,25 @@ class Runner(object):
         noise_levels = torch.linspace(opt.t0, opt.T, opt.interval, device=opt.device) * opt.interval
         self.net = Image256Net(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1, spm=opt.spm)
         self.rainfall_emb = RainfallEmbedder(256, 1)
-        params = list(self.net.parameters()) + list(self.rainfall_emb.parameters())
+        # print out the flops of self.net and self.rainfall_emb
+        # print(f"Network FLOPs: {count_flops(self.net, self.rainfall_emb, (1, 3, 256, 256)) / 1e9:.2f} GFLOPs")
+        # print(f"Rainfall Embedder FLOPs: {count_flops(self.rainfall_emb, (1, 4, 256)) / 1e9:.2f} GFLOPs")
+        # self.spm_model = WeightedSumHead(dim=24)
+        self.spm_model = WeightedSumHeadUpdated(dim=24)
+        # print("weight shape:", self.spm_model.lin.weight)
+        print("SPM model weights:", self.spm_model.w_base)
+        print("SPM model bias:", self.spm_model.w_dem_delta.weight)
+        params = list(self.net.parameters()) + list(self.rainfall_emb.parameters() )
+        params += list(self.spm_model.parameters()) if opt.auto_spm else []
+        # params = [
+        #     {"params": self.net.parameters(), "weight_decay": opt.l2_norm},
+        #     {"params": self.rainfall_emb.parameters(), "weight_decay": opt.l2_norm},
+        #     {"params": self.spm_model.parameters(), "weight_decay": 0},
+        # ]
+        # [[0.8688, 0.8978, 0.9912, 0.8514, 1.0660, 0.8630, 1.0805, 1.0857, 0.8951,
+        #  1.0177, 0.9929, 0.9000, 1.1266, 1.0872, 0.9186, 0.9086, 0.9189, 1.0403,
+        #  0.9085, 1.1300, 1.1367, 1.1165, 0.9820, 0.9652]
         self.ema = ExponentialMovingAverage(params, decay=opt.ema)
-
         if opt.load:
             checkpoint = torch.load(opt.load, map_location="cpu")
             self.net.load_state_dict(checkpoint['net'])
@@ -138,6 +326,11 @@ class Runner(object):
             log.info(f"[Ema] Loaded ema ckpt: {opt.load}!")
             self.rainfall_emb.load_state_dict(checkpoint['embedding'])
             log.info(f"[Embedding] Loaded embedding ckpt: {opt.load}!")
+            # self.spm_model.load_state_dict(checkpoint['spm'])
+            # log.info(f"[SPM] Loaded SPM model ckpt: {opt.load}!")
+            # print out the weight of the spm model
+            # print("SPM model weights:", self.spm_model.lin.weight)
+            # print("SPM model bias:", self.spm_model.w_dem_delta.weight)
             if opt.normalize_latent:
                 self.net.ori_latent_mean = checkpoint["ori_latent_mean"]
                 self.net.ori_latent_std = checkpoint["ori_latent_std"]
@@ -148,6 +341,7 @@ class Runner(object):
         self.net.to(opt.device)
         self.ema.to(opt.device)
         self.rainfall_emb.to(opt.device)
+        # self.spm_model.to(opt.device)
 
         self.log = log
 
@@ -284,13 +478,11 @@ class Runner(object):
         return pred_x0
 
     def sample_batch(self, opt, loader, corrupt_method):
-        clean_img, corrupt_img, mask, y, image_name, spm = next(loader)
-            # convert clean_image to binary mask, >250=0 <250=1
-
-        # os.makedirs(".debug", exist_ok=True)
-        # tu.save_image((clean_img+1)/2, ".debug/clean.png", nrow=4)
-        # tu.save_image((corrupt_img+1)/2, ".debug/corrupt.png", nrow=4)
-        # debug()
+        if opt.nv_loss or opt.single_dem:
+            clean_img, corrupt_img, mask, y, image_name, spm, vx, vy, prev_vx, prev_vy, prev_h, cur = next(loader)
+        else:
+            clean_img, corrupt_img, mask, y, image_name, spm, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image = next(loader)
+            # convert clean_image to binary mask, >250=0 <25
         # y is rainfall value in this case (24)
         y  = y.detach().to(opt.device)
         x0 = clean_img.detach().to(opt.device)
@@ -298,9 +490,19 @@ class Runner(object):
         mask = mask.detach().to(opt.device)
         cond = x1.detach() if opt.cond_x1 else None
         spm = spm.detach().to(opt.device)
-
-        if opt.add_x1_noise: # only for decolor
-            x1 = x1 + torch.randn_like(x1)
+        x1 = torch.randn_like(x1) if opt.fm else x1
+        if opt.nv_loss or opt.single_dem:
+            vx = vx.detach().to(opt.device)
+            vy = vy.detach().to(opt.device)
+            prev_vx = prev_vx.detach().to(opt.device)
+            prev_vy = prev_vy.detach().to(opt.device)
+            prev_h = prev_h.detach().to(opt.device)
+            cur_rainfall = cur.detach().to(opt.device)
+            return x0, x1, mask, y, cond, spm, vx, vy, prev_vx, prev_vy, prev_h, cur_rainfall
+        else:
+            spm_bank = spm_bank.detach().to(opt.device)
+            spm_bins = spm_bins.detach().to(opt.device)
+            dem_num = dem_num.detach().to(opt.device)
 
         assert x0.shape == x1.shape
 
@@ -310,20 +512,28 @@ class Runner(object):
             cond = self.cond_stage_model(cond)
             mask = self.cond_stage_model(mask) if mask is not None else None
 
-        return x0, x1, mask, y, cond, spm
+        return x0, x1, mask, y, cond, spm, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image
 
     def train(self, opt, train_dataset, val_dataset, corrupt_method):
         gradient_list = []
         embedder_gradient_list = []
-        losses = []
+        plot_loss = []
+        plot_lpdes_loss = []
 
-        def plot_losses():
+        def plot_losses(losses, lpdes_loss):
             plt.figure(figsize=(12, 8))
             plt.plot(np.log(losses))
             plt.xlabel("Iterations")
             plt.ylabel("Log Loss")
             plt.title("Log Loss per Iteration")
-            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\losses_log_scale_otode_continuous_128_norm_SDE.png")
+            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\loss_plot.png")
+
+            plt.figure(figsize=(12, 8))
+            plt.plot(np.log(lpdes_loss))
+            plt.xlabel("Iterations")
+            plt.ylabel("Log LPDEs Loss")
+            plt.title("Log LPDEs Loss per Iteration")
+            plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\lpdes_loss_plot.png")
     
         def plot_model_gradients(model, embedder):
             def format_scientific(val):
@@ -400,12 +610,13 @@ class Runner(object):
             
         self.writer = util.build_log_writer(opt)
         log = self.log
-
+        spm_weights = []
+        dem_weights = []
         net = self.net
         ema = self.ema
         # print(net)
         rainfall_embber = self.rainfall_emb
-        print(rainfall_embber)
+        # print(rainfall_embber)
         optimizer, sched = build_optimizer_sched(opt, rainfall_embber, net, log)
 
         train_loader = util.setup_loader(train_dataset, opt.microbatch)
@@ -418,10 +629,15 @@ class Runner(object):
         n_inner_loop = opt.batch_size // (opt.global_size * opt.microbatch)
         for it in range(opt.num_itr):
             optimizer.zero_grad()
-
+            losses = []
+            lpdes = []
+            lpdes_norm = []
             for _ in range(n_inner_loop):
                 # ===== sample boundary pair =====
-                x0, x1, mask, y, cond, spm = self.sample_batch(opt, train_loader, corrupt_method)
+                if opt.nv_loss or opt.single_dem:
+                    x0, x1, mask, y, cond, spm, vx, vy, prev_vx, prev_vy, prev_h, cur_rainfall = self.sample_batch(opt, train_loader, corrupt_method)
+                else:
+                    x0, x1, mask, y, cond, spm, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image = self.sample_batch(opt, train_loader, corrupt_method)
 
                 # ===== compute loss =====
                 if opt.timestep_importance == 'continuous':
@@ -432,6 +648,21 @@ class Runner(object):
                     if opt.ot_ode:
                         xt = (1-step) * x0 + step * x1
                         label = x1 - x0
+
+                        # log_snr_max = 10
+                        # log_snr_min = -10
+                        # log_snr_t = step * log_snr_min + (1 - step) * log_snr_max
+                        # sqrt_alpha_bar_t = torch.sqrt(torch.sigmoid(log_snr_t))
+                        # sqrt_one_minus_alpha_bar_t = torch.sqrt(torch.sigmoid(-log_snr_t))
+                        # label = x1
+
+                        # # The final forward process equation
+                        # xt = sqrt_alpha_bar_t * x0 + sqrt_one_minus_alpha_bar_t * x1
+                        
+                        # xt = x1
+                        # step = torch.ones((x0.shape[0], 1, 1, 1)).to(x0.device) * 0.9999
+                        # label = x0
+
                     if not opt.ot_ode:
                         # var = (step**2 * (1-step)**2) / (step**2 + (1-step)**2)
                         # randn + loss x1-x0 perform good
@@ -446,39 +677,132 @@ class Runner(object):
                     xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
                     label = self.compute_label(step, x0, xt, x1)
 
-
                 # xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
                 # label = self.compute_label(step, x0, xt, x1)
 
                 rainfall_emb = rainfall_embber(y)
+                # append 0 to last dimension as 256 dimension
+                # rainfall_emb = y.unsqueeze(-1)
+                # rainfall_emb = rainfall_emb.expand(-1, -1, 256)
+                # # convert rainfall_emb to float 32
+                # rainfall_emb = rainfall_emb.to(torch.float32)
+                if opt.auto_spm:
+                    # spm_pred = self.spm_model(y).squeeze(1)  # (B,)
+                    spm_pred = self.spm_model(y, dem_num).squeeze(1)  # (B,)
+                    spm, weights = soft_bin_blend(spm_bank, spm_bins, spm_pred)
                 pred = net(xt, step, rainfall_emb, cond=cond, spm=spm)
                 assert xt.shape == label.shape == pred.shape
 
                 if mask is not None:
                     pred_mask = mask * pred
                     label_mask = mask * label
+                if opt.nv_loss:
+                    pred_h0 = x1 - pred
+                    pred_h0 = pred_h0 * 0.056 + 0.98
+                    pred_h0 = torch.clamp(pred_h0, 0, 1)
 
+                    # pred_h0 value 0 == flood depth 4, value 1 == flood depth 0
+                    pred_h0_flood_depth = (1 - pred_h0) * 4.0  # (B,1,H,W)
+                    # pred_h0_t = pred_h0_flood_depth.squeeze(1) # (B,H,W)
+
+                    dem_height = x1 * 0.22 + 0.18
+                    dem_height = torch.clamp(dem_height, 0, 1)
+
+                    # # normalize per-sample across H,W (avoid div-by-0)
+                    dmin = dem_height.amin(dim=(2,3), keepdim=True)
+                    dmax = dem_height.amax(dim=(2,3), keepdim=True)
+                    dem_height_norm = (dem_height - dmin) / (torch.clamp(dmax - dmin, min=1e-8)) * 17.0
+                    dem_height = torch.clamp(dem_height_norm, 0, 17)
+                    dem_height_t = dem_height.squeeze(1)  # (B,H,W)
+
+                    # total_height = dem_height_t + pred_h0_t  # (B,H,W)
+
+                    # # compute the velocity field from pred_h0_np
+                    # lu, lv, lg = navier_stokes_operators_torch(prev_u=prev_vx, prev_v=prev_vy,
+                    #                                      cur_u=vx, cur_v=vy, h=total_height)
+                    lu = continuity_residual_torch(prev_h=prev_h, cur_h=pred_h0_flood_depth,
+                                                   cur_ux=vx, cur_uy=vy, elevation=dem_height_t, rainfall=cur_rainfall)
                 loss = F.mse_loss(pred, label) + F.mse_loss(pred_mask, label_mask) * 0 if mask is not None else F.mse_loss(pred, label)
+                if opt.nv_loss:
+                    # NV loss weighting decays by factor 0.9 every 1000 iterations
+                    base_nv_loss_weight = 0.1
+                    # decay_factor = 0.9
+                    # decay_every = 1000
+                    # nv_loss_weighting = base_nv_loss_weight * (decay_factor ** (it // decay_every))
+                    # lu_norm = torch.linalg.vector_norm(lu, dim=(1,2))
+                    # lv_norm = torch.linalg.vector_norm(lv, dim=(1,2))
+                    # lpde_mean = (lu_norm + lv_norm).mean()
+                    # lpde_mean_norm = torch.abs(lpde_mean - 0.152)
+                    lpdes_mean = torch.mean(torch.sum(lu**2, dim=(1,2)))
+                    # lpdes_mean_norm = torch.abs(lpdes_mean - 0.0352)
+                    loss += base_nv_loss_weight * lpdes_mean
+                    lpdes.append(lpdes_mean.item())
+                    lpdes_norm.append(lpdes_mean.item())
                 loss.backward()
                 losses.append(loss.item())
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1)
+            torch.nn.utils.clip_grad_norm_(rainfall_embber.parameters(), max_norm=1)
+            # print out rainfall embedder gradients
+            # print("Rainfall Embedder Gradients:")
+            # for name, param in rainfall_embber.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"{name}: {param.grad.abs().mean().item():.6f}")
+            #         # print out the gradients for each layer
+            #         for i, layer in enumerate(param.grad):
+            #             print(f"Layer {i}: {layer.abs().mean().item():.6f}")
+            # print("net Gradients:")
+            # for name, param in net.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"{name}: {param.grad.abs().mean().item():.6f}")
             # plot_grad_flow(net)
             optimizer.step()
             ema.update()
             if sched is not None: sched.step()
 
             # -------- logging --------
-            log.info("train_it {}/{} | lr:{} | loss:{}".format(
+            log.info("train_it {}/{} | lr:{} | loss:{} | lpde:{} | lpde_norm:{}".format(
                 1+it,
                 opt.num_itr,
                 "{:.2e}".format(optimizer.param_groups[0]['lr']),
-                "{:+.4f}".format(loss.item()),
+                "{:+.4f}".format(np.mean(losses)),
+                "{:+.4f}".format(np.mean(lpdes)),
+                "{:+.4f}".format(np.mean(lpdes_norm)),
             ))
+            plot_loss.append(np.mean(losses))
+            plot_lpdes_loss.append(np.mean(lpdes_norm))
+
             if it % 10 == 0:
                 self.writer.add_scalar(it, 'loss', loss.detach())
 
+            if it % 100 == 0 and opt.auto_spm:
+                print("SPM model weights:", self.spm_model.w_base)
+                spm_weights.append(self.spm_model.w_base.detach().cpu().numpy().flatten())
+                # help me plot the 24 weight in a plot, each weight is a line
+                plt.figure(figsize=(12, 6))
+                for i in range(24):
+                    plt.plot(range(1, len(spm_weights)+1), [w[i] for w in spm_weights], marker='o', label=f'Weight {i+1}')
+                plt.xlabel('Iteration')
+                plt.ylabel('Weight Value')
+                plt.title('SPM Model Weights Over Time')
+                # put legend outside the plot
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\spm_w_base_weights_over_time.png")
+
+                # print("DEM model weights:", self.spm_model.w_dem_delta.weight)
+                # dem_weights.append(self.spm_model.w_dem_delta.weight.detach().cpu().numpy())
+                # # help me plot the 60 weight in a plot, each weight is a lin
+                # plt.figure(figsize=(12, 6))
+                # for i in range(self.spm_model.dem_num):
+                #     plt.plot(range(1, len(dem_weights)+1), [w[i] for w in dem_weights], marker='o', label=f'DEM Weight {i+1}')
+                # plt.xlabel('Iteration')
+                # plt.ylabel('Weight Value')
+                # plt.title('SPM Model DEM Weights Over Time')
+                # # put legend outside the plot
+                # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                # plt.savefig("C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\res\\spm_dem_weights_over_time.png")
+
             if it % 200 == 0 and it != 0:
-                plot_losses()
+                plot_losses(plot_loss, plot_lpdes_loss)
             #     plot_model_gradients(net, rainfall_embber)
 
             if it % 1000 == 0:
@@ -486,6 +810,7 @@ class Runner(object):
                     torch.save({
                         "net": self.net.state_dict(),
                         'embedding': self.rainfall_emb.state_dict(),
+                        # "spm": self.spm_model.state_dict(),
                         "ema": ema.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "sched": sched.state_dict() if sched is not None else sched,
@@ -500,8 +825,12 @@ class Runner(object):
             #     net.train()
         self.writer.close()
 
+    
     @torch.no_grad()
-    def ddpm_sampling(self, opt, x1, y, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True, eval=False, ode_method=None):
+    def ddpm_sampling(self, opt, x1, y, mask=None, cond=None, spm=None, spm_bank=None, 
+                      spm_bins=None, dem_num=None, clip_denoise=False, 
+                      nfe=None, log_count=10, verbose=True, eval=False, ode_method=None, 
+                      vx_image=None, prev_vx_image=None, vy_image=None, prev_vy_image=None):
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -522,6 +851,10 @@ class Runner(object):
             
         x1 = x1.to(opt.device)
         if cond is not None: cond = cond.to(opt.device)
+        if spm is not None: spm = spm.to(opt.device)
+        if spm_bank is not None: spm_bank = spm_bank.to(opt.device)
+        if spm_bins is not None: spm_bins = spm_bins.to(opt.device)
+
         mask = None
         if mask is not None:
             mask = mask.to(opt.device)
@@ -533,16 +866,21 @@ class Runner(object):
             def pred_x0_fn(x1, xt, rainfall_emb, step, ode=None):
                 if not ode:
                     step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.long)
-                    out = self.net(xt, step, rainfall_emb, cond=cond)
+                    out = self.net(xt, step, rainfall_emb, cond=cond, spm=spm)
                     return self.compute_pred_x0(step, x1, xt, out, clip_denoise=clip_denoise)
                 else:
                     step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.float32)
-                    out = self.net(xt, step, rainfall_emb, cond=cond)
+                    out = self.net(xt, step, rainfall_emb, cond=cond, spm=spm)
                     return out
 
             rainfall_emb = self.rainfall_emb(y)
+            # if opt.auto_spm:
+            #     spm_pred = self.spm_model(y, dem_num).squeeze(1)
+            #     spm, weights = soft_bin_blend(spm_bank, spm_bins, spm_pred)
+
             xs, pred_x0 = self.diffusion.ddpm_sampling(
-                steps, pred_x0_fn, x1, rainfall_emb, mask=mask, ot_ode=opt.ot_ode, log_steps=log_steps, verbose=verbose, ode_method=ode_method
+                steps, pred_x0_fn, x1, rainfall_emb, mask=mask, ot_ode=opt.ot_ode, log_steps=log_steps, verbose=verbose, ode_method=ode_method,
+                vx_image=vx_image, prev_vx_image=prev_vx_image, vy_image=vy_image, prev_vy_image=prev_vy_image
             )
 
         b, *xdim = x1.shape
