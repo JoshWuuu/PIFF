@@ -61,8 +61,8 @@ def calculate_distances(real_folder, fake_folder):
         # l2_distances.append(np.sqrt(np.mean((real_image - fake_image) ** 2)))
         linf_distances.append(np.max(abs(real_image - fake_image)))
 
-    for filename, l1_mean in zip(real_filenames, l1_distances):
-        print(filename, l1_mean)
+    # for filename, l1_mean in zip(real_filenames, l1_distances):
+    #     print(filename, l1_mean)
     # print filename with l1 distances
     # for filename, l1_distance in zip(real_filenames, l1_distances):
     #     print(filename, l1_distance)
@@ -80,8 +80,8 @@ if __name__ == "__main__":
 # Usage example
 # real_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/datasets/euv/image/test"
 # fake_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/results/p2p_wgangp_bs64_batch_pixel"
-    real_folder = "C:\\Users\\User\\Desktop\\dev\\test_total"
-    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\flood-dems-b128-sde-norm-novar-rand01\\test3_nfe10_euler-maruyama-dcvar"
+    real_folder = "C:\\Users\\User\\Desktop\\dev\\test_total_8_29_62"
+    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem\\test3_nfe10_euler-dcvar"
     saving_path_name = 'latent_i2sb'
     real_filenames, fid, l1_distances, l2_distances, linf_distances, water_l1_depth, water_rmse_depth, max_water_depth, water_percentage_depth = calculate_distances(real_folder, fake_folder)
 
