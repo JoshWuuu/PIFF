@@ -402,6 +402,29 @@ class QKVAttention(nn.Module):
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
 
+class PatchGANDiscriminator(nn.Module):
+    """The PatchGAN Discriminator Architecture."""
+    def __init__(self, in_channels=1): # 6 (condition) + 1 (image)
+        super(PatchGANDiscriminator, self).__init__()
+
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalization:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *discriminator_block(in_channels, 64, normalization=False),
+            *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            *discriminator_block(256, 512),
+            nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(512, 1, 4, padding=1, bias=False) # Final 1-channel output
+        )
+
+    def forward(self, img):
+        return self.model(img)
 
 class UNetModel(nn.Module):
     """
@@ -491,7 +514,7 @@ class UNetModel(nn.Module):
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, 2, ch, 3, padding=1))]
+            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
         )
         self._feature_size = ch
         input_block_chans = [ch]
