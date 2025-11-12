@@ -14,9 +14,10 @@ import omegaconf
 import yaml
 
 from .util import unsqueeze_xdim
-from i2sb.VQGAN.vqgan import VQModel
+# from i2sb.VQGAN.vqgan import VQModel
 
 from ipdb import set_trace as debug
+from .nv_loss import navier_stokes_operators, navier_stokes_operators_torch
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode
@@ -122,8 +123,15 @@ class Diffusion():
 
         return xt_prev
 
-    def ddpm_sampling(self, steps, pred_x0_fn, x1, rainfall_emb, mask=None, ot_ode=False, log_steps=None, verbose=True, ode_method=None):
+    def ddpm_sampling(self, steps, pred_x0_fn, x1, rainfall_emb, mask=None, ot_ode=False, 
+                      log_steps=None, verbose=True, ode_method=None, pde_guidance=None, 
+                      vx_image=None, prev_vx_image=None, vy_image=None, prev_vy_image=None):
         xt = x1.detach().to(self.device)
+
+        def forward(xt, step):
+            rand = torch.randn_like(xt) * 0.1
+            xt = (1-step) * xt + step * x1 + rand
+            return xt
 
         xs = []
         pred_x0s = []
@@ -180,6 +188,11 @@ class Diffusion():
             # t = t.view(-1, 1, 1, 1)
             for i in range(len(steps)):
                 drift = pred_x0_fn(x1, xt, rainfall_emb, t, ode_method)
+
+                if pde_guidance:
+                    prev_vxt = forward(prev_vx_image, t)
+                    curr_vxt = forward(vx_image, t)
+                    
                 xt = xt - step_size * drift
                 t = t - step_size
 
