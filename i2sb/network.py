@@ -56,7 +56,8 @@ class Image256Net(torch.nn.Module):
 
         # t = self.noise_levels[steps].detach()
         t = steps.detach()
-        t = t[:, 0,0,0]
+        if t.dim() != 1:
+            t = t[:, 0,0,0]
         assert t.dim()==1 and t.shape[0] == x.shape[0]
 
         x = torch.cat([x, cond], dim=1) if self.cond else x
