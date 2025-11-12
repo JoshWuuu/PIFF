@@ -8,6 +8,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import sys
 import random
 import argparse
@@ -40,13 +41,13 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-
+    
 def create_training_options():
     # --------------- basic ---------------
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed",           type=int,   default=0)
-    parser.add_argument("--name",           type=str,   default='flood-single-b128-sde-norm-novar-rand01',        help="experiment ID")
-    parser.add_argument("--ckpt",           type=str,   default=None,        help="resumed checkpoint name")
+    parser.add_argument("--name",           type=str,   default='piff-multidem',        help="experiment ID")
+    parser.add_argument("--ckpt",           type=str,   default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem',        help="resumed checkpoint name")
     parser.add_argument("--gpu",            type=int,   default=0,        help="set only if you wish to run on a particular device")
     parser.add_argument("--n-gpu-per-node", type=int,   default=1,           help="number of gpu on each node")
     parser.add_argument("--master-address", type=str,   default='localhost', help="address for master")
@@ -69,12 +70,14 @@ def create_training_options():
     # parser.add_argument("--beta-min",       type=float, default=0.1)
     parser.add_argument("--ot-ode",         action="store_true",  default=False,           help="use OT-ODE model")
     parser.add_argument("--clip-denoise",   action="store_true",             help="clamp predicted image to [-1,1] at each")
-
+    parser.add_argument("--auto-spm",      action="store_true",  default=False,           help="use SPM prediction")
     # optional configs for conditional network
+    parser.add_argument('--fm',          action="store_true",  default=False,           help="use flow matching")
     parser.add_argument("--cond-x1",        action="store_true",  default=True,            help="conditional the network on degraded images")
-    parser.add_argument("--spm",          action="store_true",  default=False,           help="use SPM for conditional network")
+    parser.add_argument("--spm",          action="store_true",  default=True,           help="use SPM for conditional network")
     parser.add_argument("--add-x1-noise",   action="store_true",             help="add noise to conditional network")
-
+    parser.add_argument("--nv_loss",        action="store_true",  default=False,           help="use navier stokes loss")
+    parser.add_argument("--single-dem",     action="store_true",  default=False,           help="use single dem as condition")
     # --------------- optimizer and loss ---------------
     parser.add_argument("--batch-size",     type=int,   default=128)
     parser.add_argument("--microbatch",     type=int,   default=4,           help="accumulate gradient over microbatch until full batch-size")
@@ -143,10 +146,12 @@ def main(opt):
     #     train_dataset = mix.MixtureCorruptDatasetTrain(opt, train_dataset)
     #     val_dataset = mix.MixtureCorruptDatasetVal(opt, val_dataset)
 
-    # train_dataset = floodDataset(opt, val=False)
-    # val_dataset = floodDataset(opt, val=True)
-    train_dataset = singleDEMFloodDataset(opt, val=False)
-    val_dataset = singleDEMFloodDataset(opt, val=True)
+    if not opt.single_dem:
+        train_dataset = floodDataset(opt, val=False)
+        val_dataset = floodDataset(opt, val=True)
+    else:
+        train_dataset = singleDEMFloodDataset(opt, val=False)
+        val_dataset = singleDEMFloodDataset(opt, val=True)
     # build corruption method
     corrupt_method = build_corruption(opt, log)
 
