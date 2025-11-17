@@ -22,5 +22,5 @@ python sample.py --ckpt <folder name of the test> \
 To modify the hyperparameters, please check sample.py. 
 ## Results
 All results from the models are in [link](https://drive.google.com/file/d/1eTqq7kO5JuGWZtlixkq03Y8zCnRvkMcx/view?usp=sharing).
-## Sourse
-The FloodDiff code was adapted from the following [BBDM](https://github.com/xuekt98/BBDM) and [I2SB](https://github.com/NVlabs/I2SB)
+## Reference
+PIFF code was adapted from the following [BBDM](https://github.com/xuekt98/BBDM) and [I2SB](https://github.com/NVlabs/I2SB)
