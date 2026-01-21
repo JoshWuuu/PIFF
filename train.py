@@ -46,8 +46,8 @@ def create_training_options():
     # --------------- basic ---------------
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed",           type=int,   default=0)
-    parser.add_argument("--name",           type=str,   default='piff-multidem',        help="experiment ID")
-    parser.add_argument("--ckpt",           type=str,   default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem',        help="resumed checkpoint name")
+    parser.add_argument("--name",           type=str,   default='test',        help="experiment ID")
+    parser.add_argument("--ckpt",           type=str,   default=None,        help="resumed checkpoint name")
     parser.add_argument("--gpu",            type=int,   default=0,        help="set only if you wish to run on a particular device")
     parser.add_argument("--n-gpu-per-node", type=int,   default=1,           help="number of gpu on each node")
     parser.add_argument("--master-address", type=str,   default='localhost', help="address for master")
@@ -76,12 +76,13 @@ def create_training_options():
     parser.add_argument("--cond-x1",        action="store_true",  default=True,            help="conditional the network on degraded images")
     parser.add_argument("--spm",          action="store_true",  default=True,           help="use SPM for conditional network")
     parser.add_argument("--add-x1-noise",   action="store_true",             help="add noise to conditional network")
-    parser.add_argument("--nv_loss",        action="store_true",  default=False,           help="use navier stokes loss")
-    parser.add_argument("--single-dem",     action="store_true",  default=False,           help="use single dem as condition")
+    parser.add_argument("--nv_loss",        action="store_true",  default=True,           help="use navier stokes loss")
+    parser.add_argument("--single-dem-num",     type=int,  default=None,           help="use single dem as condition")
+    parser.add_argument("--testing-rainfall", type=list, default=[1,2,3], help="specify the rainfall for testing, e.g., --testing-rainfall 5 10 15")
     # --------------- optimizer and loss ---------------
     parser.add_argument("--batch-size",     type=int,   default=128)
     parser.add_argument("--microbatch",     type=int,   default=4,           help="accumulate gradient over microbatch until full batch-size")
-    parser.add_argument("--num-itr",        type=int,   default=1000000,     help="training iteration")
+    parser.add_argument("--num-itr",        type=int,   default=100000,     help="training iteration")
     parser.add_argument("--lr",             type=float, default=5e-5,        help="learning rate")
     parser.add_argument("--lr-gamma",       type=float, default=0.99,        help="learning rate decay ratio")
     parser.add_argument("--lr-step",        type=int,   default=1000,        help="learning rate decay step size")
@@ -136,22 +137,11 @@ def main(opt):
     if opt.seed is not None:
         set_seed(opt.seed + opt.global_rank)
 
-    # # build imagenet dataset
-    # train_dataset = imagenet.build_lmdb_dataset(opt, log, train=True)
-    # val_dataset   = imagenet.build_lmdb_dataset(opt, log, train=False)
-    # # note: images should be normalized to [-1,1] for corruption methods to work properly
-
-    # if opt.corrupt == "mixture":
-    #     import corruption.mixture as mix
-    #     train_dataset = mix.MixtureCorruptDatasetTrain(opt, train_dataset)
-    #     val_dataset = mix.MixtureCorruptDatasetVal(opt, val_dataset)
-
-    if not opt.single_dem:
-        train_dataset = floodDataset(opt, val=False)
-        val_dataset = floodDataset(opt, val=True)
-    else:
-        train_dataset = singleDEMFloodDataset(opt, val=False)
-        val_dataset = singleDEMFloodDataset(opt, val=True)
+    train_dataset = floodDataset(opt, val=False, train_dem_num=opt.single_dem_num, testing_rainfall=opt.testing_rainfall)
+    val_dataset = floodDataset(opt, val=True, train_dem_num=opt.single_dem_num, testing_rainfall=opt.testing_rainfall)
+    # else:
+    #     train_dataset = singleDEMFloodDataset(opt, val=False)
+    #     val_dataset = singleDEMFloodDataset(opt, val=True)
     # build corruption method
     corrupt_method = build_corruption(opt, log)
 

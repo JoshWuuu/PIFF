@@ -153,31 +153,40 @@ class MixtureCorruptDatasetVal(Dataset):
         return clean_img, corrupt_img, y
 
 class floodDataset(Dataset):
-    def __init__(self, opt, val=False, test=False):
+    def __init__(self, opt, val=False, test=False, train_dem_num=None, testing_rainfall=None):
         super(floodDataset, self).__init__()
         self.opt = opt
-        dem_path = Path(opt.dataset_dir) / 'dem_png'
-        self.spm_folder = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\SPM_71dem_output'
-        # list all the subfolder in the dem_path, for example subfolder is 1, 2, 3 then return me [1, 2, 3]
-
-        self.dem_stat = "C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png\\elevation_stats.csv"
-        self.dem_stat = pd.read_csv(self.dem_stat)
-        # self.dem = cv2.imread(dem_path)
-        # self.dem = cv2.cvtColor(self.dem, cv2.COLOR_BGR2GRAY)
-        # self.dem = cv2.cvtColor(self.dem, cv2.COLOR_GRAY2BGR)
+        
         self.test = test
-
-        self.flood_path = Path(opt.dataset_dir) / 'd'
-        self.vx = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vx'
-        self.vy = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vy'
-        dem_folder = [int(f) for f in os.listdir(self.flood_path) if os.path.isdir(os.path.join(self.flood_path, f))]
-        rainfall_path = Path(opt.dataset_dir) / 'scenario_rainfall.csv'
-        self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\50PNG\\maxmin_duv.csv"
+        if not test:
+            self.dem_folder = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png'
+            self.flood_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\d'
+            self.vx = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vx'
+            self.vy = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vy'
+            self.dem_stat = "C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png\\elevation_stats.csv"
+            self.dem_stat = pd.read_csv(self.dem_stat)
+            if train_dem_num is not None:
+                dem_folder = [train_dem_num]
+            else:
+                dem_folder = [int(f)for f in os.listdir(self.flood_path) if os.path.isdir(os.path.join(self.flood_path, f))]
+            rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\scenario_rainfall.csv'
+            self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\50PNG\\maxmin_duv.csv"
+            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\d'
+            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\vx'
+            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\vy'
         if test:
-            dem_folder = [8, 29, 62]
-            self.flood_path = "C:\\Users\\User\\Desktop\\dev\\50PNG\\test\\d"
-            self.vx = "C:\\Users\\User\\Desktop\\dev\\50PNG\\test\\vx"
-            self.vy = "C:\\Users\\User\\Desktop\\dev\\50PNG\\test\\vy"
+            dem_folder = "C:\\Users\\User\\Desktop\\dev\\yilan\\dem"
+            self.flood_path = "C:\\Users\\User\\Desktop\\dev\\yilan\\d"
+            self.vx = "C:\\Users\\User\\Desktop\\dev\\yilan\\vx"
+            self.vy = "C:\\Users\\User\\Desktop\\dev\\yilan\\vy"
+            self.dem_stat = "C:\\Users\\User\\Desktop\\dev\\yilan\\maxmin_dem.csv"
+            self.dem_stat = pd.read_csv(self.dem_stat)
+            self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\yilan\\maxmin_duv.csv"
+            rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\yilan\\scenario_rainfall.csv'
+            dem_folder = [1,2,3]
+            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\d'
+            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\vx'
+            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\vy'
 
         rainfall = pd.read_csv(rainfall_path)
         # remove first row, no 0 row 
@@ -186,18 +195,20 @@ class floodDataset(Dataset):
         # Initialize lists to store cell values and their positions
         rainfall_cum_value = []
         cell_positions = []
-        spm = []
 
         val = False
         # Iterate through each column
         for dem_num in dem_folder:
-            if dem_num in [11, 43, 47, 57, 65]:
+            if dem_num in [11, 43, 47, 57, 65,
+                           18, 35, 37, 42, 45]:
                 continue
             for col in rainfall.columns:
                 if col == 'time':
                     continue
                 col_num = int(col.split("_")[1])
                 if (val and col_num not in [2]) or (not val and col_num in []):
+                    continue
+                if (col_num in testing_rainfall and not test) or (test and col_num not in testing_rainfall):
                     continue
                 cell_values = []
                 # Iterate through each row in the current column
@@ -209,30 +220,22 @@ class floodDataset(Dataset):
                     temp.extend(cell_values)
                     if len(temp) == 25:
                         temp = temp[1:]
-                    # sum_rainfall = sum(temp[24:])
-                    decay = 0.95
-                    weights = [decay ** (len(temp)-i) for i in range(len(temp))]
-                    sum_rainfall = sum([v * w for v, w in zip(temp, weights)])
-                    # ceil the number to the nearest 5 multiple
+                    sum_rainfall = sum(temp[24:])
                     # if all the value is 0, then skip
                     if not test and sum_rainfall <= 5:
                         if np.random.rand() < 0.8:
                             continue
-                    spm.append((dem_num, int(np.ceil(sum_rainfall / 5) * 5)))
                     rainfall_cum_value.append(temp[:])
                     # col_num is the rainfall index, and row is the time index
                     cell_positions.append((dem_num, col_num, row))   
 
         self.rainfall = rainfall_cum_value
         self.cell_positions = cell_positions
-        self.spm = spm
-        self._spm_cache = {}
         # print training data len
         print(f"Training data length: {len(self.cell_positions)}")
         # add transform , to tensor and normalize
         self.transform = T.Compose([
             T.ToTensor(),
-            # T.Lambda(lambda t: (t * 2) - 1)
         ])
 
     def __find_flood_image(self, cell_position, flood_path):
@@ -252,72 +255,48 @@ class floodDataset(Dataset):
         image_path = os.path.join(flood_path, dem_folder_name, folder_name, image_name)
         return image_path
     
+    def __find_ca4d_image(self, cell_position, flood_path):
+        dem, col, row = cell_position
+        path_code = {self.ca4d_d: 'd', self.ca4d_vx: 'vx', self.ca4d_vy: 'vy'}
+        dem_folder_name = str(dem)
+        if col < 100:
+            folder_name = f"rf{col:02d}"
+        else:
+            folder_name = f"rf{col}"
+        image_name = f"ca4d_{dem_folder_name}_{folder_name}_{path_code[flood_path]}_{row:03d}.png"
+        image_path = os.path.join(flood_path, dem_folder_name, folder_name, image_name)
+        return image_path
+    
     def __find_dem_image(self, cell_position):
         dem_num = cell_position[0]
-        dem_folder = Path(self.opt.dataset_dir) /  'dem_png'
-        dem_path = os.path.join(dem_folder, f'{dem_num}.png')
+        dem_path = os.path.join(self.dem_folder, f'{dem_num}.png')
         return dem_path
-    
-    def _load_spm_bank_for_dem(self, dem_num):
-        """
-        Scan self.spm_folder/{dem}/SPM_{dem}_{bin}.png -> stack into (K, 1, H, W)
-        Cache per DEM.
-        """
-        if dem_num in self._spm_cache:
-            return self._spm_cache[dem_num]
-
-        dem_dir = os.path.join(self.spm_folder, str(dem_num))
-        if not os.path.exists(dem_dir):
-            # empty bank fallback
-            self._spm_cache[dem_num] = (torch.zeros(0, 1, 1, 1), torch.zeros(0))
-            return self._spm_cache[dem_num]
-
-        # Find all matching files
-        pat = re.compile(rf'^SPM_{dem_num}_(\d+)\.png$')
-        entries = []
-        for fname in os.listdir(dem_dir):
-            m = pat.match(fname)
-            if m:
-                bin_val = int(m.group(1))
-                entries.append((bin_val, os.path.join(dem_dir, fname)))
-
-        # sort by bin
-        entries.sort(key=lambda t: t[0])
-
-        spm_imgs = []
-        bins = []
-        for bin_val, path in entries:
-            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)  # (H, W)
-            if img is None:
-                continue
-            t = self.transform(img)                # (1, H, W), float in [0,1]
-            t = (t * 2) - 1                        # your original scaling
-            spm_imgs.append(t)
-            bins.append(bin_val)
-
-        if len(spm_imgs) == 0:
-            bank = torch.zeros(0, 1, 1, 1)
-            bin_vals = torch.zeros(0)
-        else:
-            bank = torch.stack(spm_imgs, dim=0)            # (K, 1, H, W)
-            bin_vals = torch.tensor(bins, dtype=torch.float32)
-
-        self._spm_cache[dem_num] = (bank, bin_vals)
-        return self._spm_cache[dem_num]
     
     def __len__(self):
         return len(self.cell_positions)
 
     def __getitem__(self, index):
-        cell_position = self.cell_positions[index]
+        # get rainfall
         rainfall = self.rainfall[index]
-        dem_num, spm_rainfall = self.spm[index]
+        rainfall = np.array(rainfall, dtype=np.int64)
+        cur_rainfall = rainfall[-1]
+
+        # get the dem, rainfall index and time index 
+        cell_position = self.cell_positions[index]
+
+        # get dem
         dem_path = self.__find_dem_image(cell_position)
         dem_image = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)[:,:,0]
-        # dem_image = cv2.cvtColor(dem_image, cv2.COLOR_GRAY2BGR)
         dem_cur_state = self.dem_stat[self.dem_stat['Filename'] == cell_position[0]]
+        # normalize different dem to 0-255 based on min max elevation
         min_elev = int(dem_cur_state['Min Elevation'].iloc[0])
         max_elev = int(dem_cur_state['Max Elevation'].iloc[0])
+        real_height = dem_image / 255 * (max_elev - min_elev) + min_elev
+        dem_image = (real_height - (-3)) / (125 + 3) * 255
+        # clamp dem_image to 0-255
+        dem_image = np.clip(dem_image, 0, 255)
+        dem_image = np.array(dem_image, dtype=np.uint8)
+
         vx_vy_cur_state = self.duv_stat[self.duv_stat['terrain'] == cell_position[0]]
         min_vx = vx_vy_cur_state['vx_min'].iloc[0]
         max_vx = vx_vy_cur_state['vx_max'].iloc[0]
@@ -325,77 +304,83 @@ class floodDataset(Dataset):
         max_vy = vx_vy_cur_state['vy_max'].iloc[0]
         min_depth = vx_vy_cur_state['depth_min'].iloc[0]
         max_depth = vx_vy_cur_state['depth_max'].iloc[0]
-        # do a normalization with max = 410 min = -3, with current max = max_elev, min = min_elev
-        real_height = dem_image / 255 * (max_elev - min_elev) + min_elev
-        dem_image = (real_height - (-3)) / (125 + 3) * 255
-        # clamp dem_image to 0-255
-        dem_image = np.clip(dem_image, 0, 255)
-        dem_image = np.array(dem_image, dtype=np.uint8)
-
-        spm_path = os.path.join(self.spm_folder, str(dem_num), f'SPM_{dem_num}_{spm_rainfall}.png')
-        spm_image = cv2.imread(spm_path, cv2.IMREAD_GRAYSCALE)
-        spm_bank, spm_bins = self._load_spm_bank_for_dem(dem_num)  # (K,1,H,W), (K,)
-        # dem_image -= dem_image.min()
-        rainfall = np.array(rainfall, dtype=np.int64)
-        # rainfall = rainfall.reshape(1, 24)
-
+        
         image_path = self.__find_flood_image(cell_position, self.flood_path)
-
-        flood_image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-        flood_image = (1-flood_image.astype(np.float32) / 255.0) * (max_depth - min_depth) + min_depth
-        flood_image = 255 - (flood_image - 0) / (6 - 0) * 255
-
         vx_path = self.__find_flood_image(cell_position, self.vx)
-        vx_image = cv2.imread(vx_path, cv2.IMREAD_UNCHANGED)
-
         vy_path = self.__find_flood_image(cell_position, self.vy)
+        flood_image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        vx_image = cv2.imread(vx_path, cv2.IMREAD_UNCHANGED)
         vy_image = cv2.imread(vy_path, cv2.IMREAD_UNCHANGED)
 
+        flood_image_real = (1-flood_image.astype(np.float32) / 255.0) * (max_depth - min_depth) + min_depth
+        flood_image = 255 - (flood_image_real - 0) / (6 - 0) * 255
+
+        vx_image = np.array(vx_image, dtype=np.float16) 
+        vy_image = np.array(vy_image, dtype=np.float16)
+        vx_image = (vx_image/255) * (max_vx - min_vx) + min_vx
+        vx_image = (vx_image - (-4)) / (4 - (-4)) * 255
+        vy_image = (vy_image/255) * (max_vy - min_vy) + min_vy
+        vy_image = (vy_image - (-4)) / (4 - (-4)) * 255
+
+        vx_image_real = vx_image/255 * (max_vx - min_vx) + min_vx
+        vy_image_real = vy_image/255 * (max_vy - min_vy) + min_vy
         prev_cell = (cell_position[0], cell_position[1], cell_position[2]-1) if cell_position[2] > 0 else (cell_position[0], cell_position[1], cell_position[2])
         prev_vx_path = self.__find_flood_image(prev_cell, self.vx)
         prev_vx_image = cv2.imread(prev_vx_path, cv2.IMREAD_UNCHANGED)
         prev_vy_path = self.__find_flood_image(prev_cell, self.vy)
         prev_vy_image = cv2.imread(prev_vy_path, cv2.IMREAD_UNCHANGED)
-        
-        # remove the fourth channel
-        # flood_image = flood_image[:, :, 2]
-        # flood_image = cv2.cvtColor(flood_image, cv2.COLOR_BGR2GRAY)
-        # flood_image = cv2.cvtColor(flood_image, cv2.COLOR_GRAY2BGR)
-        # convert flood_image to binary mask, >236=0 <236=1, due to the flood depth 30cm 
-        binary_mask = (flood_image <= 236).astype('uint8')
-        # binary_mask = cv2.cvtColor(binary_mask, cv2.COLOR_BGR2GRAY)
-        # unsqueeze first dimension of binary_mask
-        binary_mask = np.expand_dims(binary_mask, axis=0)
-        # flood_image = flood_image *4 / 3
-        # flood_image = (flood_image-32) / (255-32) * 255
-        flood_image = np.array(flood_image, dtype=np.uint8)
-        # flood_image = np.clip(flood_image, 0, 255)
-        # IF FLOOD image not 256x256, print the shape and the image_path
-        # flood_image = Image.open(image_path).convert('RGB')
-        # flood_image = np.array(flood_image)
-        # print(flood_image.shape, image_path)
-        # convert to RGB if grayscale
-        # if len(flood_image.shape) == 2:
-        #     flood_image = cv2.cvtColor(flood_image, cv2.COLOR_GRAY2RGB)
-        # if len(dem_image.shape) == 2:
-        #     dem_image = cv2.cvtColor(dem_image, cv2.COLOR_GRAY2RGB)
-        spm_image = self.transform(spm_image)
-        dem_image = self.transform(dem_image)
-        flood_image = self.transform(flood_image)
-
-        spm_image = (spm_image * 2) - 1
-        dem_image = (dem_image - 0.18) / 0.22
-        flood_image = (flood_image - 0.986) / 0.041
-
-        vx_image = np.array(vx_image, dtype=np.float16) 
-        vy_image = np.array(vy_image, dtype=np.float16)
+        prev_h_path = self.__find_flood_image(prev_cell, self.flood_path)
+        prev_h_image = cv2.imread(prev_h_path, cv2.IMREAD_UNCHANGED)
         prev_vx_image = np.array(prev_vx_image, dtype=np.float16)
         prev_vy_image = np.array(prev_vy_image, dtype=np.float16)
-        vx_image = vx_image/255 * (max_vx - min_vx) + min_vx
-        vy_image = vy_image/255 * (max_vy - min_vy) + min_vy
-        prev_vx_image = prev_vx_image/255 * (max_vx - min_vx) + min_vx
-        prev_vy_image = prev_vy_image/255 * (max_vy - min_vy) + min_vy
-        return flood_image, dem_image, binary_mask, rainfall, image_path, spm_image, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image
+        prev_h_image = np.array(prev_h_image, dtype=np.float16)
+        prev_vx_image_real = prev_vx_image/255 * (max_vx - min_vx) + min_vx
+        prev_vy_image_real = prev_vy_image/255 * (max_vy - min_vy) + min_vy
+        prev_h_image_real = (1-prev_h_image.astype(np.float32) / 255.0) * (max_depth - min_depth) + min_depth
+        
+        ca4d_d_path = self.__find_ca4d_image(cell_position, self.ca4d_d)
+        ca4d_d_image = cv2.imread(ca4d_d_path, cv2.IMREAD_UNCHANGED)
+        ca4d_vx_path = self.__find_ca4d_image(cell_position, self.ca4d_vx)
+        ca4d_vx_image = cv2.imread(ca4d_vx_path, cv2.IMREAD_UNCHANGED)
+        ca4d_vy_path = self.__find_ca4d_image(cell_position, self.ca4d_vy)
+        ca4d_vy_image = cv2.imread(ca4d_vy_path, cv2.IMREAD_UNCHANGED)
+
+        ca4d_d_image = (1-ca4d_d_image.astype(np.float32) / 255.0) * (max_depth - min_depth) + min_depth
+        ca4d_d_image = 255 - (ca4d_d_image - 0) / (6 - 0) * 255
+        ca4d_vx_image = np.array(ca4d_vx_image, dtype=np.float16)
+        ca4d_vy_image = np.array(ca4d_vy_image, dtype=np.float16)
+        ca4d_vx_image = (ca4d_vx_image/255) * (max_vx - min_vx) + min_vx
+        ca4d_vx_image = (ca4d_vx_image - (-4)) / (4 - (-4)) * 255
+        ca4d_vy_image = (ca4d_vy_image/255) * (max_vy - min_vy) + min_vy
+        ca4d_vy_image = (ca4d_vy_image - (-4)) / (4 - (-4)) * 255
+
+        dem_image = np.array(dem_image, dtype=np.uint8)
+        flood_image = np.array(flood_image, dtype=np.uint8)
+        vx_image = np.array(vx_image, dtype=np.uint8)
+        vy_image = np.array(vy_image, dtype=np.uint8)
+        ca4d_d_image = np.array(ca4d_d_image, dtype=np.uint8)
+        ca4d_vx_image = np.array(ca4d_vx_image, dtype=np.uint8)
+        ca4d_vy_image = np.array(ca4d_vy_image, dtype=np.uint8)
+        dem_image = self.transform(dem_image)
+        flood_image = self.transform(flood_image)
+        vx_image = self.transform(vx_image)
+        vy_image = self.transform(vy_image)
+        ca4d_d_image = self.transform(ca4d_d_image)
+        ca4d_vx_image = self.transform(ca4d_vx_image)
+        ca4d_vy_image = self.transform(ca4d_vy_image)
+
+        dem_image = (dem_image - 0.18) / 0.22
+        flood_image = (flood_image - 0.986) / 0.043
+        vx_image = (vx_image - 0.498) / 0.0049
+        vy_image = (vy_image - 0.499) / 0.0043
+        ca4d_d_image = (ca4d_d_image - 0.985) / 0.05
+        ca4d_vx_image = (ca4d_vx_image - 0.498) / 0.017
+        ca4d_vy_image = (ca4d_vy_image - 0.499) / 0.017
+
+        physics_features = [cur_rainfall, flood_image_real, vx_image_real, vy_image_real, 
+                            prev_h_image_real, prev_vx_image_real, prev_vy_image_real]
+
+        return dem_image, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features
 
 class singleDEMFloodDataset(Dataset):
     def __init__(self, opt, val=False, test=False):
