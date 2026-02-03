@@ -171,9 +171,9 @@ class floodDataset(Dataset):
                 dem_folder = [int(f)for f in os.listdir(self.flood_path) if os.path.isdir(os.path.join(self.flood_path, f))]
             rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\scenario_rainfall.csv'
             self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\50PNG\\maxmin_duv.csv"
-            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\d'
-            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\vx'
-            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi_ca4d\\vy'
+            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\d'
+            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vx'
+            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vy'
         if test:
             dem_folder = "C:\\Users\\User\\Desktop\\dev\\yilan\\dem"
             self.flood_path = "C:\\Users\\User\\Desktop\\dev\\yilan\\d"
@@ -184,9 +184,9 @@ class floodDataset(Dataset):
             self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\yilan\\maxmin_duv.csv"
             rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\yilan\\scenario_rainfall.csv'
             dem_folder = [1,2,3]
-            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\d'
-            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\vx'
-            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan_ca4d\\vy'
+            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\d'
+            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\vx'
+            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\vy'
 
         rainfall = pd.read_csv(rainfall_path)
         # remove first row, no 0 row 
@@ -213,6 +213,8 @@ class floodDataset(Dataset):
                 cell_values = []
                 # Iterate through each row in the current column
                 for row in range(len(rainfall)):
+                    if row == 0:
+                        continue
                     cell_value = rainfall.iloc[row][col]
                     cell_values.append(np.ceil(cell_value))
                     # make it a len 24 list if not append 0 in front
@@ -378,9 +380,9 @@ class floodDataset(Dataset):
         ca4d_vy_image = (ca4d_vy_image - 0.499) / 0.017
 
         physics_features = [cur_rainfall, flood_image_real, vx_image_real, vy_image_real, 
-                            prev_h_image_real, prev_vx_image_real, prev_vy_image_real]
+                            prev_h_image_real, prev_vx_image_real, prev_vy_image_real, image_path]
 
-        return dem_image, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features
+        return dem_image, rainfall, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features
 
 class singleDEMFloodDataset(Dataset):
     def __init__(self, opt, val=False, test=False):

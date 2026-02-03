@@ -81,7 +81,7 @@ if __name__ == "__main__":
 # real_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/datasets/euv/image/test"
 # fake_folder = "/home/Josh/BrightestImageProcessing/Josh/image_generation/style_transfer/pytorch-CycleGAN-and-pix2pix/results/p2p_wgangp_bs64_batch_pixel"
     real_folder = "C:\\Users\\User\\Desktop\\dev\\test_total_8_29_62"
-    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem\\test3_nfe10_euler-dcvar"
+    fake_folder = "C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem-continu-pinn\\test3_nfe10_euler-dcvar"
     saving_path_name = 'latent_i2sb'
     real_filenames, fid, l1_distances, l2_distances, linf_distances, water_l1_depth, water_rmse_depth, max_water_depth, water_percentage_depth = calculate_distances(real_folder, fake_folder)
 

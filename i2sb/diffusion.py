@@ -189,9 +189,9 @@ class Diffusion():
             for i in range(len(steps)):
                 drift = pred_x0_fn(x1, xt, rainfall_emb, t, ode_method)
 
-                if pde_guidance:
-                    prev_vxt = forward(prev_vx_image, t)
-                    curr_vxt = forward(vx_image, t)
+                # if pde_guidance:
+                #     prev_vxt = forward(prev_vx_image, t)
+                #     curr_vxt = forward(vx_image, t)
                     
                 xt = xt - step_size * drift
                 t = t - step_size

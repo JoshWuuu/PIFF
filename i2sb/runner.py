@@ -55,7 +55,7 @@ def build_optimizer_sched(opt, rainfall_embber, net, log, spm=None):
         # sched = lr_scheduler.StepLR(optimizer, **sched_dict)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=100000,   # full run, no restarts
+            T_max=opt.num_itr,   # full run, no restarts
             eta_min=1e-8
         )
         log.info(f"[Opt] Built lr step scheduler {sched_dict=}!")
@@ -483,24 +483,18 @@ class Runner(object):
         return pred_x0
 
     def sample_batch(self, opt, loader, corrupt_method):
-        dem_image, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features = next(loader)
-        y  = y.detach().to(opt.device)
-        x0 = clean_img.detach().to(opt.device)
-        x1 = corrupt_img.detach().to(opt.device)
-        mask = mask.detach().to(opt.device)
-        cond = x1.detach() if opt.cond_x1 else None
-        spm = spm.detach().to(opt.device)
+        dem_image, rainfall, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features = next(loader)
+        x0 = torch.cat([flood_image, vx_image, vy_image], dim=1).detach().to(opt.device)
+        x1 = dem_image.detach().to(opt.device)
+        # make x1 have the same channel as x0
+        x1 = x1.repeat(1, 3, 1, 1)
+        cond = torch.cat([ca4d_d_image, ca4d_vx_image, ca4d_vy_image], dim=1).detach().to(opt.device)
         x1 = torch.randn_like(x1) if opt.fm else x1
+        rainfall = rainfall.detach().to(opt.device)
 
-        assert x0.shape == x1.shape
+        # assert x0.shape == x1.shape
 
-        vx_image = vx_image.detach().to(opt.device)
-        vy_image = vy_image.detach().to(opt.device)
-        prev_vx_image = prev_vx_image.detach().to(opt.device)
-        prev_vy_image = prev_vy_image.detach().to(opt.device)
-        prev_h_image = prev_h_image.detach().to(opt.device)
-        cur_rainfall = cur_rainfall.detach().to(opt.device)
-        return x0, x1, mask, y, cond, spm, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image, prev_h_image, cur_rainfall
+        return x0, x1, cond, rainfall, physics_features
 
     def train(self, opt, train_dataset, val_dataset, corrupt_method):
         gradient_list = []
@@ -622,7 +616,7 @@ class Runner(object):
             lpdes_norm = []
             for _ in range(n_inner_loop):
                 # ===== sample boundary pair =====
-                x0, x1, mask, y, cond, spm, spm_bank, spm_bins, dem_num, vx, vy, prev_vx_image, prev_vy_image, prev_h_image, cur_rainfall = self.sample_batch(opt, train_loader, corrupt_method)
+                x0, x1, cond, rainfall, physics_features = self.sample_batch(opt, train_loader, corrupt_method)
 
                 # ===== compute loss =====
                 if opt.timestep_importance == 'continuous':
@@ -647,38 +641,27 @@ class Runner(object):
                     xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
                     label = self.compute_label(step, x0, xt, x1)
 
-                # xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
-                # label = self.compute_label(step, x0, xt, x1)
-
-                rainfall_emb = rainfall_embber(y)
-                # append 0 to last dimension as 256 dimension
-                # rainfall_emb = y.unsqueeze(-1)
-                # rainfall_emb = rainfall_emb.expand(-1, -1, 256)
-                # # convert rainfall_emb to float 32
-                # rainfall_emb = rainfall_emb.to(torch.float32)
-                if opt.auto_spm:
-                    # spm_pred = self.spm_model(y).squeeze(1)  # (B,)
-                    spm_pred = self.spm_model(y, dem_num).squeeze(1)  # (B,)
-                    spm, weights = soft_bin_blend(spm_bank, spm_bins, spm_pred)
-                pred = net(xt, step, rainfall_emb, cond=cond, spm=spm)
+                rainfall_emb = rainfall_embber(rainfall)
+                pred = net(xt, step, rainfall_emb, cond=x0, ca4d=cond)
                 assert xt.shape == label.shape == pred.shape
 
-                if mask is not None:
-                    pred_mask = mask * pred
-                    label_mask = mask * label
                 if opt.nv_loss:
-                    pred_h0 = x1 - pred
-                    pred_h0 = pred_h0 * 0.041 + 0.986
+                    cur_rainfall, flood_image_real, vx_image_real, vy_image_real, prev_h_image_real, prev_vx_image_real, prev_vy_image_real,_ = physics_features
+                    pred_x0 = x1 - pred
+                    pred_h0 = pred_x0[:, 0, :, :] * 0.043 + 0.986
                     pred_h0 = torch.clamp(pred_h0, 0, 1)
-
-                    # pred_h0 value 0 == flood depth 4, value 1 == flood depth 0
                     pred_h0_flood_depth = (1 - pred_h0) * (6 - 0) + 0  # (B,1,H,W)
-                    # pred_h0_t = pred_h0_flood_depth.squeeze(1) # (B,H,W)
+
+                    pred_vx = pred_x0[:, 1, :, :] * 0.0049 + 0.498
+                    pred_vx = torch.clamp(pred_vx, 0, 1)
+                    pred_vx_real = pred_vx * (4 - (-4)) + (-4)  # (B,1,H,W)
+
+                    pred_vy = pred_x0[:, 2, :, :] * 0.0043 + 0.499
+                    pred_vy = torch.clamp(pred_vy, 0, 1)
+                    pred_vy_real = pred_vy * (4 - (-4)) + (-4)  # (B,1,H,W)     
 
                     dem_height = x1 * 0.22 + 0.18
                     dem_height = torch.clamp(dem_height, 0, 1)
-
-                    # # normalize per-sample across H,W (avoid div-by-0)
                     dem_height_norm = dem_height * (125 - (-3)) + (-3)
                     dem_height_t = dem_height_norm.squeeze(1)  # (B,H,W)
 
@@ -687,9 +670,9 @@ class Runner(object):
                     # # compute the velocity field from pred_h0_np
                     # lu, lv, lg = navier_stokes_operators_torch(prev_u=prev_vx, prev_v=prev_vy,
                     #                                      cur_u=vx, cur_v=vy, h=total_height)
-                    lu = continuity_residual_torch(prev_h=prev_h_image, cur_h=pred_h0_flood_depth,
-                                                   cur_ux=vx, cur_uy=vy, elevation=dem_height_t, rainfall=cur_rainfall)
-                loss = F.mse_loss(pred, label) + F.mse_loss(pred_mask, label_mask) * 0 if mask is not None else F.mse_loss(pred, label)
+                    lu = continuity_residual_torch(prev_h=prev_h_image_real, cur_h=pred_h0_flood_depth,
+                                                   cur_ux=pred_vx_real, cur_uy=pred_vy_real, elevation=dem_height_t, rainfall=cur_rainfall)
+                loss = F.mse_loss(pred, label)
                 if opt.nv_loss:
                     # NV loss weighting decays by factor 0.9 every 1000 iterations
                     base_nv_loss_weight = 0.1
@@ -772,7 +755,7 @@ class Runner(object):
                 plot_losses(plot_loss, plot_lpdes_loss)
             #     plot_model_gradients(net, rainfall_embber)
 
-            if it % 1000 == 0:
+            if it % 1000 == 0 and it != 0:
                 if opt.global_rank == 0:
                     torch.save({
                         "net": self.net.state_dict(),
@@ -837,7 +820,7 @@ class Runner(object):
                     return self.compute_pred_x0(step, x1, xt, out, clip_denoise=clip_denoise)
                 else:
                     step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.float32)
-                    out = self.net(xt, step, rainfall_emb, cond=cond, spm=spm)
+                    out = self.net(xt, step, rainfall_emb, cond=x1, ca4d=cond)
                     return out
 
             rainfall_emb = self.rainfall_emb(y)

@@ -35,14 +35,15 @@ class Image256Net(torch.nn.Module):
         kwargs["num_channels"] = 128
         kwargs['image_size'] = 256
         kwargs['num_heads'] = 8
+        kwargs['ca4d_spade'] = True 
         self.diffusion_model = create_model(**kwargs)
         log.info(f"[Net] Initialized network from {ckpt_pkl=}! Size={util.count_parameters(self.diffusion_model)}!")
 
         # load (modified) adm ckpt
         # if pretrained_adm:
             # ckpt_pt = os.path.join(ckpt_dir, I2SB_IMG256_COND_CKPT if cond else I2SB_IMG256_UNCOND_CKPT)
-            # out = torch.load(ckpt_pt, map_location="cpu")
-            # self.diffusion_model.load_state_dict(out)
+            # out = torch.load(ckpt_pt, map_location="cpu") 
+            # self.diffusion_model.load_state_dict(out) 
             # log.info(f"[Net] Loaded pretrained adm {ckpt_pt=}!")
 
         self.diffusion_model.apply(self.init_weights)
@@ -52,7 +53,7 @@ class Image256Net(torch.nn.Module):
         self.spm = spm
         self.noise_levels = noise_levels
 
-    def forward(self, x, steps, rainfall, cond=None, spm=None):
+    def forward(self, x, steps, rainfall, cond=None, ca4d=None):
 
         # t = self.noise_levels[steps].detach()
         t = steps.detach()
@@ -61,9 +62,8 @@ class Image256Net(torch.nn.Module):
         assert t.dim()==1 and t.shape[0] == x.shape[0]
 
         x = torch.cat([x, cond], dim=1) if self.cond else x
-        x = torch.cat([x, spm], dim=1) if self.spm else x
-        return self.diffusion_model(x, t, rainfall)
-    
+        return self.diffusion_model(x, t, rainfall, ca4d=ca4d)
+
     def init_weights(self, module):
         if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Conv1d)):
             nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')

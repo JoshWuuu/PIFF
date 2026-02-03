@@ -77,10 +77,10 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    def forward(self, x, emb, ca4d=None, context=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
+                x = layer(x, emb, ca4d=ca4d)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
             else:
@@ -150,21 +150,51 @@ class Downsample(nn.Module):
         return self.op(x)
 
 
+class SPADE(nn.Module):
+    def __init__(self, norm_nc, pci_nc, kernel_size=3):
+        """
+        :param norm_nc: Channels in the feature map x (to be normalized)
+        :param pci_nc: Channels in the condition image (pci)
+        """
+        super().__init__()
+        
+        # 1. Standard GroupNorm (without affine parameters, since we predict them)
+        self.param_free_norm = nn.GroupNorm(32, norm_nc, affine=True)
+        
+        # 2. Convolutions to predict gamma and beta from pci
+        self.mlp_shared = nn.Sequential(
+            conv_nd(2, pci_nc, 128, kernel_size=kernel_size, padding=1),
+            nn.SiLU()
+        )
+        self.mlp_gamma = conv_nd(2, 128, norm_nc, kernel_size=kernel_size, padding=1)
+        self.mlp_beta = conv_nd(2, 128, norm_nc, kernel_size=kernel_size, padding=1)
+
+    def forward(self, x, pci):
+        # x: [B, C, H_curr, W_curr]
+        # pci: [B, C_pci, H_orig, W_orig]
+        
+        # 1. Downsample pci to match the current feature map resolution
+        pci_ds = F.interpolate(pci, size=x.shape[2:], mode='nearest')
+        
+        # 2. Normalize x
+        normalized = self.param_free_norm(x)
+        
+        # 3. Predict scale (gamma) and shift (beta)
+        act = self.mlp_shared(pci_ds)
+        gamma = self.mlp_gamma(act)
+        beta = self.mlp_beta(act)
+        
+        # 4. Apply modulation
+        out = normalized * (1 + gamma) + beta
+        return out
+
 class ResBlock(TimestepBlock):
     """
-    A residual block that can optionally change the number of channels.
-
-    :param channels: the number of input channels.
-    :param emb_channels: the number of timestep embedding channels.
-    :param dropout: the rate of dropout.
-    :param out_channels: if specified, the number of out channels.
-    :param use_conv: if True and out_channels is specified, use a spatial
-        convolution instead of a smaller 1x1 convolution to change the
-        channels in the skip connection.
-    :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param use_checkpoint: if True, use gradient checkpointing on this module.
-    :param up: if True, use this block for upsampling.
-    :param down: if True, use this block for downsampling.
+    A residual block that allows for dilated convolutions.
+    
+    :param dilation: The dilation rate for the convolutions. 
+                     Default is 1 (standard convolution).
+                     If > 1, padding is adjusted to maintain spatial dimensions.
     """
 
     def __init__(
@@ -179,6 +209,10 @@ class ResBlock(TimestepBlock):
         use_checkpoint=False,
         up=False,
         down=False,
+        decay_rate=0,
+        decay_count=1,
+        dilation=1,  # <--- NEW PARAMETER
+        ca4d_channels=0,
     ):
         super().__init__()
         self.channels = channels
@@ -188,21 +222,31 @@ class ResBlock(TimestepBlock):
         self.use_conv = use_conv
         self.use_checkpoint = use_checkpoint
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.decay_rate = decay_count * decay_rate
+        self.dilation = dilation # <--- Store it
+        self.ca4d_channels = ca4d_channels
 
-        self.in_layers = nn.Sequential(
-            normalization(channels),
-            nn.SiLU(),
-            conv_nd(dims, channels, self.out_channels, 3, padding=1),
-        )
+        # 1. MAIN BRANCH CONVOLUTION
+        # We set padding=dilation to keep the output size the same as input size
+        self.conv1 = conv_nd(dims, channels, self.out_channels, 3, padding=1)
+
+        if self.ca4d_channels > 0:
+            self.in_norm = SPADE(channels, self.ca4d_channels)
+            self.in_act = nn.SiLU()
+        else:
+            self.in_layers = nn.Sequential(
+                normalization(channels),
+                nn.SiLU(),
+            )
 
         self.updown = up or down
 
         if up:
-            self.h_upd = Upsample(channels, False, dims)
-            self.x_upd = Upsample(channels, False, dims)
+            self.h_upd = Upsample(channels, True, dims)
+            self.x_upd = Upsample(channels, True, dims)
         elif down:
-            self.h_upd = Downsample(channels, False, dims)
-            self.x_upd = Downsample(channels, False, dims)
+            self.h_upd = Downsample(channels, True, dims)
+            self.x_upd = Downsample(channels, True, dims)
         else:
             self.h_upd = self.x_upd = nn.Identity()
 
@@ -213,48 +257,71 @@ class ResBlock(TimestepBlock):
                 2 * self.out_channels if use_scale_shift_norm else self.out_channels,
             ),
         )
+        
+        # 2. OUTPUT BRANCH CONVOLUTION
         self.out_layers = nn.Sequential(
             normalization(self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
             zero_module(
-                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+                conv_nd(
+                    dims, 
+                    self.out_channels, 
+                    self.out_channels, 
+                    3, 
+                    padding=dilation,  # <--- Modified
+                    padding_mode="reflect",
+                    dilation=dilation  # <--- Modified
+                )
             ),
         )
 
+        # 3. SKIP CONNECTION
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
+            # If we are changing channels with a convolution, we must also 
+            # match the dilation if we want consistent receptive fields,
+            # though usually skip connections are 1x1 or 3x3. 
+            # If 3x3, we must dilate. If 1x1, dilation doesn't apply the same way.
+            # Assuming 3x3 for robust skip:
             self.skip_connection = conv_nd(
-                dims, channels, self.out_channels, 3, padding=1
+                dims, 
+                channels, 
+                self.out_channels, 
+                3, 
+                padding=dilation, # <--- Modified
+                dilation=dilation # <--- Modified
             )
         else:
+            # 1x1 conv (usually doesn't support dilation > 1 effectively for resizing)
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
-    def forward(self, x, emb):
-        """
-        Apply the block to a Tensor, conditioned on a timestep embedding.
-
-        :param x: an [N x C x ...] Tensor of features.
-        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
+    def forward(self, x, emb, ca4d=None):
         return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+            self._forward, (x, emb, ca4d), self.parameters(), self.use_checkpoint
         )
 
-    def _forward(self, x, emb):
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
+    def _forward(self, x, emb, ca4d=None):
+        if self.ca4d_channels > 0:
+            assert ca4d is not None, "ca4d_channels > 0 but ca4d input is None"
+            h = self.in_norm(x, ca4d) # Apply SPADE
+            h = self.in_act(h)       # Apply SiLU
         else:
-            h = self.in_layers(x)
+            h = self.in_layers(x) # Standard Norm + SiLU
+
+        # 2. Resampling (if up or down is True)
+        if self.updown:
+            h = self.h_upd(h) # Upsample/Downsample features
+            x = self.x_upd(x) # Upsample/Downsample skip connection
+
+        # 3. First Convolution
+        h = self.conv1(h)
+            
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
+            
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(emb_out, 2, dim=1)
@@ -263,7 +330,8 @@ class ResBlock(TimestepBlock):
         else:
             h = h + emb_out
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+            
+        return self.skip_connection(x) * (1 - self.decay_rate) + h
 
 
 class AttentionBlock(nn.Module):
@@ -480,6 +548,7 @@ class UNetModel(nn.Module):
         use_new_attention_order=False,
         use_spatial_transformer=True,
         transformer_depth=1,
+        ca4d_spade=False,
     ):
         super().__init__()
 
@@ -530,6 +599,7 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        ca4d_channels=3 if ca4d_spade else 0,
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -566,6 +636,7 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             down=True,
+                            ca4d_channels=3 if ca4d_spade else 0,
                         )
                         if resblock_updown
                         else Downsample(
@@ -586,6 +657,7 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+                ca4d_channels=3 if ca4d_spade else 0,
             ),
             AttentionBlock(
                 ch,
@@ -603,6 +675,7 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+                ca4d_channels=3 if ca4d_spade else 0,
             ),
         )
         self._feature_size += ch
@@ -620,6 +693,7 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        ca4d_channels=3 if ca4d_spade else 0,
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -647,6 +721,7 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
+                            ca4d_channels=3 if ca4d_spade else 0,
                         )
                         if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
@@ -677,7 +752,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, rainfall, y=None):
+    def forward(self, x, timesteps, rainfall, ca4d=None, y=None):
         """
         Apply the model to an input batch.
 
@@ -699,12 +774,12 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, rainfall)
+            h = module(h, emb, context=rainfall, ca4d=ca4d)
             hs.append(h)
-        h = self.middle_block(h, emb, rainfall)
+        h = self.middle_block(h, emb, context=rainfall, ca4d=ca4d)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, rainfall)
+            h = module(h, emb, context=rainfall, ca4d=ca4d)
         h = h.type(x.dtype)
         return self.out(h)
 

@@ -113,32 +113,19 @@ def get_recon_imgs_fn(opt, nfe):
     return recon_imgs_fn
 
 def compute_batch(ckpt_opt, corrupt_type, corrupt_method, out):
-    spm_bank, spm_bins, dem_num = None, None, None
-    if "inpaint" in corrupt_type:
-        clean_img, y, mask = out
-        corrupt_img = clean_img * (1. - mask) + mask
-        x1          = clean_img * (1. - mask) + mask * torch.randn_like(clean_img)
-    elif corrupt_type == "mixture":
-        # clean_img, corrupt_img, binary_mask, y, image_name, spm, spm_bank, spm_bins, dem_num = out
-        clean_img, corrupt_img, binary_mask, y, image_name, spm, spm_bank, spm_bins, dem_num, vx_image, vy_image, prev_vx_image, prev_vy_image = out 
-        x1 = corrupt_img.to(opt.device)
-        y = y.to(opt.device)
-        mask = None
-    else:
-        clean_img, y = out
-        mask = None
-        corrupt_img = corrupt_method(clean_img.to(opt.device))
-        x1 = corrupt_img.to(opt.device)
-
-    cond = x1.detach() if ckpt_opt.cond_x1 else None
-    if ckpt_opt.add_x1_noise: # only for decolor
-        x1 = x1 + torch.randn_like(x1)
+    dem_image, rainfall, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features = out 
+    x0 = torch.cat([flood_image, vx_image, vy_image], dim=1).detach().to(opt.device)
+    x1 = dem_image.detach().to(opt.device)
+    # make x1 have the same channel as x0
+    x1 = x1.repeat(1, 3, 1, 1)
+    ca4d = torch.cat([ca4d_d_image, ca4d_vx_image, ca4d_vy_image], dim=1).detach().to(opt.device)
+    rainfall = rainfall.detach().to(opt.device)
 
     if ckpt_opt.fm:
         x1 = torch.randn_like(x1)
 
     # return corrupt_img, x1, mask, cond, y, image_name, spm, spm_bank, spm_bins, dem_num
-    return corrupt_img, x1, mask, cond, y, image_name, spm, vx_image, prev_vx_image, vy_image, prev_vy_image, dem_num
+    return x0, x1, ca4d, rainfall, physics_features
 
 @torch.no_grad()
 def main(opt):
@@ -181,28 +168,28 @@ def main(opt):
     ys = []
     num = 0
     for loader_itr, out in enumerate(val_loader):
-            
-        corrupt_img, x1, mask, cond, y, image_name, spm, vx_image, prev_vx_image, vy_image, prev_vy_image, dem_num = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
-        
+
+        x0, x1, mask, ca4d, rainfall, physics_features = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
+
         xs, _ = runner.ddpm_sampling(
-            ckpt_opt, x1, y, mask=mask, cond=cond, spm=spm, vx_image=vx_image,
-              prev_vx_image=prev_vx_image, vy_image=vy_image, prev_vy_image=prev_vy_image, dem_num=dem_num, clip_denoise=opt.clip_denoise, nfe=nfe, verbose=opt.n_gpu_per_node==1, eval=True, ode_method=opt.sampling_method,
+            ckpt_opt, x1, rainfall, mask=mask, cond=ca4d, 
+            clip_denoise=opt.clip_denoise, nfe=nfe, verbose=opt.n_gpu_per_node==1, eval=True, ode_method=opt.sampling_method,
         )
         recon_img = xs[:, 0, ...].to(opt.device)
         # recon_img = xs
 
-        assert recon_img.shape == corrupt_img.shape
+        assert recon_img.shape == x0.shape
 
         # if loader_itr == 0 and opt.global_rank == 0: # debug
         #     os.makedirs(".debug", exist_ok=True)
         #     # tu.save_image((corrupt_img+1)/2, ".debug/corrupt.png")
         #     # tu.save_image((recon_img+1)/2, ".debug/recon.png")
         #     log.info("Saved debug images!")
-
+        image_name = physics_features[-1]
         for i in range(len(recon_img)):
             rec = recon_img[i]
             # rec = (rec + 1) / 2
-            rec = rec * 0.035 + 0.98
+            rec = rec * 0.041 + 0.986
             # get  the  last \\ 
             path = image_name[i].split("\\")[-1]
             save_path = recon_imgs_fn.parent / f"recon_{path}"
@@ -250,7 +237,7 @@ if __name__ == '__main__':
     # sample
     parser.add_argument("--batch-size",     type=int,  default=12)
     parser.add_argument("--sampling-method", type=str, default='euler', help="sampling method")
-    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem',        help="the checkpoint name from which we wish to sample")
+    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem-continu-pinn',        help="the checkpoint name from which we wish to sample")
     parser.add_argument("--nfe",            type=int,  default=10,        help="sampling steps")
     parser.add_argument("--clip-denoise",   action="store_true",            help="clamp predicted image to [-1,1] at each")
     parser.add_argument("--use-fp16",       action="store_true",            help="use fp16 network weight for faster sampling")
