@@ -153,10 +153,10 @@ class MixtureCorruptDatasetVal(Dataset):
         return clean_img, corrupt_img, y
 
 class floodDataset(Dataset):
-    def __init__(self, opt, val=False, test=False, train_dem_num=None, testing_rainfall=None):
+    def __init__(self, opt, val=False, test=False, train_dem_num=None, testing_rainfall=None, same_dem=False):
         super(floodDataset, self).__init__()
         self.opt = opt
-        
+        self.yilan = False
         self.test = test
         if not test:
             self.dem_folder = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png'
@@ -174,8 +174,8 @@ class floodDataset(Dataset):
             self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\d'
             self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vx'
             self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vy'
-        if test:
-            dem_folder = "C:\\Users\\User\\Desktop\\dev\\yilan\\dem"
+        elif test and not same_dem:
+            self.dem_folder = "C:\\Users\\User\\Desktop\\dev\\yilan\\dem"
             self.flood_path = "C:\\Users\\User\\Desktop\\dev\\yilan\\d"
             self.vx = "C:\\Users\\User\\Desktop\\dev\\yilan\\vx"
             self.vy = "C:\\Users\\User\\Desktop\\dev\\yilan\\vy"
@@ -187,6 +187,23 @@ class floodDataset(Dataset):
             self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\d'
             self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\vx'
             self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\yilan\\vy'
+            self.yilan = True
+        elif test and same_dem:
+            self.dem_folder = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png'
+            self.flood_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\d'
+            self.vx = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vx'
+            self.vy = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\vy'
+            self.dem_stat = "C:\\Users\\User\\Desktop\\dev\\50PNG\\dem_png\\elevation_stats.csv"
+            self.dem_stat = pd.read_csv(self.dem_stat)
+            if train_dem_num is not None:
+                dem_folder = [train_dem_num]
+            else:
+                dem_folder = [int(f)for f in os.listdir(self.flood_path) if os.path.isdir(os.path.join(self.flood_path, f))]
+            rainfall_path = 'C:\\Users\\User\\Desktop\\dev\\50PNG\\scenario_rainfall.csv'
+            self.maxmin_duv = "C:\\Users\\User\\Desktop\\dev\\50PNG\\maxmin_duv.csv"
+            self.ca4d_d = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\d'
+            self.ca4d_vx = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vx'
+            self.ca4d_vy = 'C:\\Users\\User\\Desktop\\dev\\ca4d\\Multi\\vy'
 
         rainfall = pd.read_csv(rainfall_path)
         # remove first row, no 0 row 
@@ -244,6 +261,8 @@ class floodDataset(Dataset):
         dem, col, row = cell_position
         path_code = {self.flood_path: 'd', self.vx: 'vx', self.vy: 'vy'}
         dem_folder_name = str(dem)
+        if self.yilan:
+            dem_folder_name = f'yilan{dem_folder_name}'
         if col < 100:
             folder_name = f"RF{col:02d}"
         else:
@@ -261,6 +280,8 @@ class floodDataset(Dataset):
         dem, col, row = cell_position
         path_code = {self.ca4d_d: 'd', self.ca4d_vx: 'vx', self.ca4d_vy: 'vy'}
         dem_folder_name = str(dem)
+        if self.yilan:
+            dem_folder_name = f'yilan{dem_folder_name}'
         if col < 100:
             folder_name = f"rf{col:02d}"
         else:
@@ -271,6 +292,8 @@ class floodDataset(Dataset):
     
     def __find_dem_image(self, cell_position):
         dem_num = cell_position[0]
+        if self.yilan:
+            dem_num = f'yilan{dem_num}'
         dem_path = os.path.join(self.dem_folder, f'{dem_num}.png')
         return dem_path
     
@@ -288,25 +311,39 @@ class floodDataset(Dataset):
 
         # get dem
         dem_path = self.__find_dem_image(cell_position)
-        dem_image = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)[:,:,0]
-        dem_cur_state = self.dem_stat[self.dem_stat['Filename'] == cell_position[0]]
+        if not self.yilan:
+            dem_image = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)[:,:,0]
+            dem_cur_state = self.dem_stat[self.dem_stat['Filename'] == cell_position[0]]
+            min_elev = int(dem_cur_state['Min Elevation'].iloc[0])
+            max_elev = int(dem_cur_state['Max Elevation'].iloc[0])
+            vx_vy_cur_state = self.duv_stat[self.duv_stat['terrain'] == cell_position[0]]
+            min_vx = vx_vy_cur_state['vx_min'].iloc[0]
+            max_vx = vx_vy_cur_state['vx_max'].iloc[0]
+            min_vy = vx_vy_cur_state['vy_min'].iloc[0]
+            max_vy = vx_vy_cur_state['vy_max'].iloc[0]
+            min_depth = vx_vy_cur_state['depth_min'].iloc[0]
+            max_depth = vx_vy_cur_state['depth_max'].iloc[0]
+        else:
+            dem_image = cv2.imread(dem_path, cv2.IMREAD_UNCHANGED)
+            terrain_name = 'yilan' + str(cell_position[0])
+            dem_cur_state = self.dem_stat[self.dem_stat['terrain'] == terrain_name]
         # normalize different dem to 0-255 based on min max elevation
-        min_elev = int(dem_cur_state['Min Elevation'].iloc[0])
-        max_elev = int(dem_cur_state['Max Elevation'].iloc[0])
+            min_elev = int(dem_cur_state['min_elevation'].iloc[0])
+            max_elev = int(dem_cur_state['max_elevation'].iloc[0])
+            vx_vy_cur_state = self.duv_stat[self.duv_stat['terrain'] == terrain_name]
+            min_vx = vx_vy_cur_state['vx_min'].iloc[0]
+            max_vx = vx_vy_cur_state['vx_max'].iloc[0]
+            min_vy = vx_vy_cur_state['vy_min'].iloc[0]
+            max_vy = vx_vy_cur_state['vy_max'].iloc[0]
+            min_depth = vx_vy_cur_state['depth_min'].iloc[0]
+            max_depth = vx_vy_cur_state['depth_max'].iloc[0]
+
         real_height = dem_image / 255 * (max_elev - min_elev) + min_elev
         dem_image = (real_height - (-3)) / (125 + 3) * 255
         # clamp dem_image to 0-255
         dem_image = np.clip(dem_image, 0, 255)
         dem_image = np.array(dem_image, dtype=np.uint8)
 
-        vx_vy_cur_state = self.duv_stat[self.duv_stat['terrain'] == cell_position[0]]
-        min_vx = vx_vy_cur_state['vx_min'].iloc[0]
-        max_vx = vx_vy_cur_state['vx_max'].iloc[0]
-        min_vy = vx_vy_cur_state['vy_min'].iloc[0]
-        max_vy = vx_vy_cur_state['vy_max'].iloc[0]
-        min_depth = vx_vy_cur_state['depth_min'].iloc[0]
-        max_depth = vx_vy_cur_state['depth_max'].iloc[0]
-        
         image_path = self.__find_flood_image(cell_position, self.flood_path)
         vx_path = self.__find_flood_image(cell_position, self.vx)
         vy_path = self.__find_flood_image(cell_position, self.vy)

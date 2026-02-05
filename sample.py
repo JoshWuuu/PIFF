@@ -100,17 +100,30 @@ def build_val_dataset(opt, log, corrupt_type):
         val_dataset = build_partition(opt, val_dataset, log)
     return val_dataset
 
-def get_recon_imgs_fn(opt, nfe):
+def get_recon_imgs_fn(opt, nfe, same_dem=False):
     test_name = opt.sampling_method + "-dcvar"
-    sample_dir = RESULT_DIR / opt.ckpt / "test3_nfe{}{}_{}".format(
-        nfe, "_clip" if opt.clip_denoise else "", test_name
-    )
-    os.makedirs(sample_dir, exist_ok=True)
+    if same_dem:
+        test_name += "-samedem"
+    else:
+        test_name += "-yilandem"
+        
+    # Helper to generate the base folder name
+    base_suffix = "nfe{}{}_{}".format(nfe, "_clip" if opt.clip_denoise else "", test_name)
 
-    recon_imgs_fn = sample_dir / "recon{}.pt".format(
-        "" if opt.partition is None else f"_{opt.partition}"
-    )
-    return recon_imgs_fn
+    # 1. Define and Create Directories
+    sample_dir_flood = RESULT_DIR / opt.ckpt / f"test3_{base_suffix}_flood"
+    sample_dir_vx = RESULT_DIR / opt.ckpt / f"test3_{base_suffix}_vx"
+    sample_dir_vy = RESULT_DIR / opt.ckpt / f"test3_{base_suffix}_vy"
+
+    for d in [sample_dir_flood, sample_dir_vx, sample_dir_vy]:
+        os.makedirs(d, exist_ok=True)
+
+    # 2. Return them as a dictionary (Recommended for clarity)
+    return {
+        "flood": sample_dir_flood,
+        "vx": sample_dir_vx,
+        "vy": sample_dir_vy
+    }
 
 def compute_batch(ckpt_opt, corrupt_type, corrupt_method, out):
     dem_image, rainfall, flood_image, vx_image, vy_image, ca4d_d_image, ca4d_vx_image, ca4d_vy_image, physics_features = out 
@@ -140,7 +153,7 @@ def main(opt):
     corrupt_method = build_corruption(opt, log, corrupt_type=corrupt_type)
 
     # build imagenet val dataset
-    val_dataset = floodDataset(opt, test=True)
+    val_dataset = floodDataset(opt, test=True, same_dem=opt.same_dem, testing_rainfall=ckpt_opt.testing_rainfall)
     # val_dataset = singleDEMFloodDataset(opt, test=True)
     n_samples = len(val_dataset)
 
@@ -161,7 +174,7 @@ def main(opt):
         runner.ema = ExponentialMovingAverage(runner.net.parameters(), decay=0.99) # re-init ema with fp16 weight
 
     # create save folder
-    recon_imgs_fn = get_recon_imgs_fn(opt, nfe)
+    recon_imgs_fn = get_recon_imgs_fn(opt, nfe, same_dem=opt.same_dem)
     log.info(f"Recon images will be saved to {recon_imgs_fn}!")
 
     recon_imgs = []
@@ -169,10 +182,10 @@ def main(opt):
     num = 0
     for loader_itr, out in enumerate(val_loader):
 
-        x0, x1, mask, ca4d, rainfall, physics_features = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
+        x0, x1, ca4d, rainfall, physics_features = compute_batch(ckpt_opt, corrupt_type, corrupt_method, out)
 
         xs, _ = runner.ddpm_sampling(
-            ckpt_opt, x1, rainfall, mask=mask, cond=ca4d, 
+            ckpt_opt, x1, rainfall, cond=ca4d, 
             clip_denoise=opt.clip_denoise, nfe=nfe, verbose=opt.n_gpu_per_node==1, eval=True, ode_method=opt.sampling_method,
         )
         recon_img = xs[:, 0, ...].to(opt.device)
@@ -187,38 +200,24 @@ def main(opt):
         #     log.info("Saved debug images!")
         image_name = physics_features[-1]
         for i in range(len(recon_img)):
-            rec = recon_img[i]
+            rec = recon_img[i, 0, :, :].unsqueeze(0)
             # rec = (rec + 1) / 2
-            rec = rec * 0.041 + 0.986
+            rec = rec * 0.043 + 0.986
             # get  the  last \\ 
             path = image_name[i].split("\\")[-1]
-            save_path = recon_imgs_fn.parent / f"recon_{path}"
+            save_path = recon_imgs_fn["flood"] / f"recon_{path}"
             tu.save_image(rec, save_path)
 
-        # [-1,1]
-    #     gathered_recon_img = collect_all_subset(recon_img, log)
-    #     recon_imgs.append(gathered_recon_img)
+            vx = recon_img[i, 1, :, :].unsqueeze(0)
+            vx = vx * 0.0049 + 0.498
+            save_path = recon_imgs_fn["vx"] / f"recon_{path}"
+            tu.save_image(vx, save_path)
 
-    #     y = y.to(opt.device)
-    #     gathered_y = collect_all_subset(y, log)
-    #     ys.append(gathered_y)
-
-    #     num += len(gathered_recon_img)
-    #     log.info(f"Collected {num} recon images!")
-    #     dist.barrier()
-
-    # del runner
-
-    # arr = torch.cat(recon_imgs, axis=0)[:n_samples]
-    # label_arr = torch.cat(ys, axis=0)[:n_samples]
-
-    # if opt.global_rank == 0:
-    #     torch.save({"arr": arr, "label_arr": label_arr}, recon_imgs_fn)
-    #     log.info(f"Save at {recon_imgs_fn}")
-    # dist.barrier()
-
-    # log.info(f"Sampling complete! Collect recon_imgs={arr.shape}, ys={label_arr.shape}")
-
+            vy = recon_img[i, 2, :, :].unsqueeze(0)
+            vy = vy * 0.0049 + 0.498
+            save_path = recon_imgs_fn["vy"] / f"recon_{path}"
+            tu.save_image(vy, save_path)
+        log.info(f"Saved recon images for batch {loader_itr}!")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -229,6 +228,7 @@ if __name__ == '__main__':
     parser.add_argument("--num-proc-node",  type=int,  default=1,           help="The number of nodes in multi node env")
     parser.add_argument("--latent-space", action="store_true", default=False, help="use latent space model")
     parser.add_argument("--eval",        action="store_true", default=True, help="")
+    parser.add_argument("--same-dem",   action="store_true", default=False, help="use same dem for testing")
     # data
     parser.add_argument("--image-size",     type=int,  default=256)
     parser.add_argument("--dataset-dir",    type=Path, default="C:\\Users\\User\\Desktop\\dev\\50PNG\\",  help="path to dataset")
@@ -237,7 +237,7 @@ if __name__ == '__main__':
     # sample
     parser.add_argument("--batch-size",     type=int,  default=12)
     parser.add_argument("--sampling-method", type=str, default='euler', help="sampling method")
-    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff-multidem-continu-pinn',        help="the checkpoint name from which we wish to sample")
+    parser.add_argument("--ckpt",           type=str,  default='C:\\Users\\User\\Desktop\\dev\\I2SB-flood\\results\\piff_multi',        help="the checkpoint name from which we wish to sample")
     parser.add_argument("--nfe",            type=int,  default=10,        help="sampling steps")
     parser.add_argument("--clip-denoise",   action="store_true",            help="clamp predicted image to [-1,1] at each")
     parser.add_argument("--use-fp16",       action="store_true",            help="use fp16 network weight for faster sampling")
