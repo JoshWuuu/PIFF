@@ -642,7 +642,7 @@ class Runner(object):
                     label = self.compute_label(step, x0, xt, x1)
 
                 rainfall_emb = rainfall_embber(rainfall)
-                pred = net(xt, step, rainfall_emb, cond=x0, ca4d=cond)
+                pred = net(xt, step, rainfall_emb, cond=x1, ca4d=cond)
                 assert xt.shape == label.shape == pred.shape
 
                 if opt.nv_loss:
